@@ -36,7 +36,7 @@
     "scripts/worker-env.sh": "1744d0d566b7970d4f25b121b774f845cfe4be8651c1986c8d9a61b52544442f",
     "tests/helpers.py": "e4599332c9a49ad094a744cafc96ab75208d0d0b02f2e1f4058cd5352de9b365",
     "tests/test_control.py": "7b705d1a218b555a704187ba4a68bf22004372b521359d5053ce893a8cf6f8ec",
-    "tests/test_endpoint_lifecycle.py": "7724305659f83f6c5b61492c26e76f7fcb0a04cf45c7d4416aa1b2331f0098e4",
+    "tests/test_endpoint_lifecycle.py": "20b918a5fefce106dadbc4718a269fb50bbe084d9c741b8de656a30bb8e30ec6",
     "tests/test_portable_configuration.py": "472e5f4f70180a733dcf59282504c866c45b16bdb34e9c37bae27e589fce4b15",
     "tests/test_read_batch.py": "4e4b6a578c45f48a6aaf1d0ce5d8e61b2f2a785e59b572730f2fab59ca9bad55",
     "tests/test_session.py": "43d2ed940f8c7466e6ea9f296fc0f23f1f64b1204a96d1c6ec2f183f0f7e796c",

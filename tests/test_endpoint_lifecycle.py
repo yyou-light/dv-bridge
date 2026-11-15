@@ -37,6 +37,7 @@ class EndpointTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(dir=TEST_TEMP)
         self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
+        private_directory(self.root/'state')
         self.allowed=private_directory(self.root/'allowed')
         self.files=Files(private_directory(self.root/'state/files'),[self.allowed],
             write_enabled=True,write_roots=[self.allowed])
