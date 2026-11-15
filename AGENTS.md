@@ -1,0 +1,13 @@
+# DV Bridge working rules
+
+- Keep source, real deployment settings, credentials and runtime results separate. Never commit `.private/`, `.work/`, keys, session files, business source, logs or waveforms.
+- Use the owner's existing logged-in graphical ETX. Do not create, resume or terminate ETX sessions, focus windows, or send simulated keyboard/mouse input.
+- On Windows use `clients/Invoke-EtxX11.ps1` as the sole transport entry. It delegates clipboard, cryptography and protocol work to `local/windows_etx_packet.ps1` and its canonical Python modules.
+- Run a simulation only on an explicit request. Reading, reviewing, preparing a patch or checking status does not authorize a new case or rerun.
+- Use only owner-authorized exact files and configured roots. UTF-8 text is limited to 512 KiB per file, ten files per read batch. Supported PDF/Office binary downloads are read-only and at most 16 MiB. Never download an FSDB through the file interface.
+- Upload only authorized UTF-8 patches with baseline SHA256, transaction backup and verified installation. Do not bypass conflicts or clear a queue to make an operation proceed.
+- One task per Worker, at most five distinct profiles `work01`–`work05`. Follow the original request ID. A timeout or uncertain outcome is queried, never blindly redispatched.
+- While simulations are running, combine status checks every 300 seconds. Do not poll Worker status when idle. This is a task-monitoring cadence, not a permanent clipboard watcher.
+- Protect exact FSDB paths against active writers and overlapping readers. Preserve an uncertain resource reservation; it must not block unrelated Worker profiles or completed files.
+- Clipboard synchronization is shared. Yield after a detected copy, wait 30 quiet seconds, keep the original request, and retain the 300-second interruption budget. Do not describe this as isolation or paste-completion detection.
+- Perform functional changes and synthetic checks in an isolated candidate. Never alter a live receiver or Worker merely to run unit tests. Live EDA, backend changes, deployment and version-control actions follow the owner's authorization.

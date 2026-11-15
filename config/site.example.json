@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "remote": {
+    "user": "",
+    "install_root": "/replace-me/etx-x11",
+    "project_root": "/replace-me/project",
+    "regression_root": "/replace-me/results",
+    "queue_root": "/replace-me/state/queue",
+    "lock_root": "/replace-me/state/locks",
+    "python": "/usr/bin/python3",
+    "eda_bin": "",
+    "lsf_queue": "syn",
+    "target": "sys_tb",
+    "simulator": "vcs",
+    "environment_script": "",
+    "lsf_module": "",
+    "fsdb_name": "waves.fsdb",
+    "openssl": "openssl"
+  },
+  "permissions": {
+    "read_roots": [],
+    "write_roots": [],
+    "wave_fsdbs": []
+  },
+  "wave": {
+    "enabled": false,
+    "root": "",
+    "release": "",
+    "compatibility_patch": "none"
+  },
+  "monitor_interval_seconds": 300
+}
