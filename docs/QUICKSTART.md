@@ -7,12 +7,12 @@
 - Linux Python 3.10+，带 Tk/X11 支持；当前账号可读写自己的安装/队列目录。
 - 跑业务 case 时另需自己的工程、LSF、`simmer` 和 EDA 环境。本包不提供这些软件或许可证。
 
-Windows 建议将源码放在 `D:\proj\dv-bridge` 这样的独立项目目录。不要放入云盘同步目录。
+Windows 建议将源码放在 `D:\proj\etx-clipboard-bridge` 这样的独立项目目录。不要放入云盘同步目录。
 
 ## 首次安装一次
 
 1. Windows 在源码根目录运行 `python scripts/configure.py windows`。填写 Linux 账号、安装根、工程根、回归根和 Python 路径。可选环境脚本。OpenSSL 不在 PATH 时加 `--openssl <本机程序路径>`。
-2. 配置程序生成 `.private/bootstrap/dv-bridge-setup.zip`。通过你已有、获准的文件传递方式将它放到刚才填写的 Linux 安装目录并解压。该个人引导包含路径配置及客户端公钥，**不含客户端私钥**；不要将个人引导包上传到公共仓库。
+2. 配置程序生成 `.private/bootstrap/etx-clipboard-bridge-setup.zip`。通过你已有、获准的文件传递方式将它放到刚才填写的 Linux 安装目录并解压。该个人引导包含路径配置及客户端公钥，**不含客户端私钥**；不要将个人引导包上传到公共仓库。
 3. 在 Linux 解压目录运行 `python3 scripts/configure.py linux`。它核对账号与目录、验证发布文件摘要，生成 Linux 独立身份和端点配置，并输出 `SERVER_FINGERPRINT`。
 4. 在已有图形 ETX 终端运行 `python3 scripts/start.py endpoint`，确认返回 `ready`。随后 Windows 运行 `python scripts/start.py pair <SERVER_FINGERPRINT>`。只需传递公钥指纹，不发送密码或私钥。
 5. 按需在不同终端运行 `python3 scripts/start.py worker work01` 等。最多五个不同编号，每个终端一条，保持运行。CLI 用 `workers` 查询新的登记，不使用别人的 Worker ID。

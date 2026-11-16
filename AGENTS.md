@@ -1,4 +1,4 @@
-# DV Bridge working rules
+# ETX Clipboard Bridge working rules
 
 - Keep source, real deployment settings, credentials and runtime results separate. Never commit `.private/`, `.work/`, keys, session files, business source, logs or waveforms.
 - Use the owner's existing logged-in graphical ETX. Do not create, resume or terminate ETX sessions, focus windows, or send simulated keyboard/mouse input.

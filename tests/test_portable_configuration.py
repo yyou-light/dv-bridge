@@ -20,7 +20,7 @@ from helpers import demo_site
 from etx_cli import Project,Failure
 from configure import create_identity
 
-TEST_TEMP=Path.cwd()/'.work/test-dv-bridge'
+TEST_TEMP=Path.cwd()/'.work/test-etx-clipboard-bridge'
 TEST_TEMP.mkdir(parents=True,exist_ok=True)
 
 
@@ -121,7 +121,7 @@ class SetupSmokeTests(unittest.TestCase):
         private=self.root/'.private'
         self.assertTrue((private/'identity/signer-key.pem').is_file())
         import zipfile
-        with zipfile.ZipFile(private/'bootstrap/dv-bridge-setup.zip') as archive:
+        with zipfile.ZipFile(private/'bootstrap/etx-clipboard-bridge-setup.zip') as archive:
             names=set(archive.namelist())
             expected=set(json.loads((self.root/'config/release.json').read_bytes())['files'])
             self.assertEqual(names,expected|{'config/release.json','bootstrap/site.json','bootstrap/client-public.pem'})

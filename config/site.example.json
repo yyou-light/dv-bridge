@@ -2,7 +2,7 @@
   "version": 1,
   "remote": {
     "user": "",
-    "install_root": "/replace-me/etx-x11",
+    "install_root": "/replace-me/etx-clipboard-bridge",
     "project_root": "/replace-me/project",
     "regression_root": "/replace-me/results",
     "queue_root": "/replace-me/state/queue",

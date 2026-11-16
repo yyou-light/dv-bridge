@@ -54,7 +54,7 @@ def create_identity(folder,name,tool):
     if cert.exists()!=key.exists():raise ValueError('PARTIAL_IDENTITY_REQUIRES_REVIEW')
     if not cert.exists():
         crypto(tool,['req','-new','-x509','-newkey','rsa:3072','-nodes','-days','365',
-            '-subj','/CN=dv-bridge-'+name,'-keyout',str(key),'-out',str(cert)])
+            '-subj','/CN=etx-clipboard-bridge-'+name,'-keyout',str(key),'-out',str(cert)])
     for p in (cert,key):
         if p.is_symlink():raise ValueError('IDENTITY_SYMLINK_REJECTED')
         os.chmod(p,0o600)
@@ -113,7 +113,7 @@ def windows(args):
         'openssl':str(tool),'rpc_timeout_seconds':30})
     write(session/'xverif-transport.json',{'transport':'x11','project_root':str(ROOT),
         'install_root':settings['remote']['install_root']})
-    bundle=private/'bootstrap/dv-bridge-setup.zip';bundle.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    bundle=private/'bootstrap/etx-clipboard-bridge-setup.zip';bundle.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
     # Only explicit public release files, public certificate and path settings.
     # No private directory traversal and no private key are ever included.
     with zipfile.ZipFile(bundle,'w',zipfile.ZIP_DEFLATED) as archive:

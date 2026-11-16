@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-TEST_TEMP=Path.cwd()/'.work/test-dv-bridge'
+TEST_TEMP=Path.cwd()/'.work/test-etx-clipboard-bridge'
 TEST_TEMP.mkdir(parents=True,exist_ok=True)
 import unittest
 

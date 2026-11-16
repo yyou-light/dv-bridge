@@ -9,7 +9,7 @@ import sys
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
-REPOSITORY='https://github.com/yyou-light/dv-bridge'
+REPOSITORY='https://github.com/yyou-light/etx-clipboard-bridge'
 FORBIDDEN=re.compile(r'\bsh-etxn[0-9]+\b|/nfs/(?:workspace[0-9]*|regression)/[A-Za-z_][A-Za-z0-9_.-]+|[A-Z]:[/\\]Users[/\\][A-Za-z_][A-Za-z0-9_.-]+',re.I)
 SECRET=re.compile(r'-----BEGIN (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----\s+[A-Za-z0-9+/=]{24,}|(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}')
 DENIED={'.private','.work','.git','bootstrap','state','identity','queue','jobs','runs','logs','backups','__pycache__'}
@@ -40,7 +40,7 @@ def main():
     args=parser.parse_args()
     names=files();version=(ROOT/'VERSION').read_text().strip()
     hashes={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in names}
-    manifest={'version':1,'project':'dv-bridge','release':version,'files':hashes}
+    manifest={'version':1,'project':'etx-clipboard-bridge','release':version,'files':hashes}
     path=ROOT/'config/release.json'
     if args.check:
         if json.loads(path.read_bytes())!=manifest:raise ValueError('RELEASE_MANIFEST_OUT_OF_DATE')
@@ -49,7 +49,7 @@ def main():
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps(manifest,ensure_ascii=False,sort_keys=True,indent=2)+'\n',encoding='utf-8',newline='\n')
     output=(args.output or ROOT/'.work/dist').absolute();output.mkdir(parents=True,exist_ok=True)
-    archive=output/('dv-bridge-'+version+'.zip')
+    archive=output/('etx-clipboard-bridge-'+version+'.zip')
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as bundle:
         for name in [*names,'config/release.json']:
             info=zipfile.ZipInfo(name,date_time=(2026,11,15,0,0,0))

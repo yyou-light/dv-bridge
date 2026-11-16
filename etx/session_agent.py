@@ -104,7 +104,7 @@ def identity_files(config):
         require(not temporary_cert.exists() and not temporary_key.exists(), 'IDENTITY_RECOVERY_REQUIRED')
         Crypto(cert,key,cert,cert,config.get('openssl','openssl')).run([
             'req','-new','-x509','-newkey','rsa:3072','-nodes','-days','365',
-            '-subj','/CN=dv-bridge-session','-keyout',str(temporary_key),
+            '-subj','/CN=etx-clipboard-bridge-session','-keyout',str(temporary_key),
             '-out',str(temporary_cert)])
         os.chmod(temporary_key,0o600)
         os.chmod(temporary_cert,0o600)

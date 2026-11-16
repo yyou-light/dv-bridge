@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-TEST_TEMP=Path.cwd()/'.work/test-dv-bridge'
+TEST_TEMP=Path.cwd()/'.work/test-etx-clipboard-bridge'
 TEST_TEMP.mkdir(parents=True,exist_ok=True)
 import threading
 import time
@@ -58,10 +58,10 @@ class ContractTests(unittest.TestCase):
             validate_file_profile(cfg,'test-node',BASE)
 
     def test_command_is_a_pinned_fixed_job(self):
-        argv=job_argv('/srv/test/dv-bridge','1'*64,'2'*64,
+        argv=job_argv('/srv/test/etx-clipboard-bridge','1'*64,'2'*64,
             'selftest','3'*32,'work04',{'hold_seconds':1})
         self.assertIn('JOB_MODULE_CHANGED',argv[3])
-        self.assertEqual(argv[-3:],['/srv/test/dv-bridge/server-control-online.json','2'*64,
+        self.assertEqual(argv[-3:],['/srv/test/etx-clipboard-bridge/server-control-online.json','2'*64,
             canonical({'kind':'selftest','request_id':'3'*32,'profile':'work04','options':{'hold_seconds':1}}).decode()])
         for kind in ('shell','exec','python'):
             with self.assertRaisesRegex(RuntimeError,'JOB_KIND_REJECTED'):

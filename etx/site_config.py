@@ -12,7 +12,7 @@ _loaded_path=None
 
 DEFAULT={
     'version':1,
-    'remote':{'user':'','install_root':'/replace-me/etx-x11','project_root':'/replace-me/project',
+    'remote':{'user':'','install_root':'/replace-me/etx-clipboard-bridge','project_root':'/replace-me/project',
         'regression_root':'/replace-me/results','queue_root':'/replace-me/state/queue',
         'lock_root':'/replace-me/state/locks','python':'/usr/bin/python3',
         'eda_bin':'','lsf_queue':'syn','target':'sys_tb','simulator':'vcs',
