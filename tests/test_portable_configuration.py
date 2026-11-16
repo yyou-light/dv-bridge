@@ -80,7 +80,13 @@ class ConfigurationTests(unittest.TestCase):
     def test_text_size_is_checked_before_chunks(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP) as tmp:
             project=Project(tmp,'a'*32)
-            project.rpc=lambda *args:{'path':'/srv/test/project/demo.sv','bytes':524289,'sha256':'0'*64}
+            def transport(command):
+                self.assertEqual(command[command.index('-Mode')+1],'SessionReadFiles')
+                value={'path':'/srv/test/project/demo.sv','bytes':256*1024*1024+1,
+                    'sha256':'0'*64,'local':str(project.result/'demo.sv')}
+                (project.result/'summary.json').write_text(json.dumps({'ok':True,'result':{'files':[value]}}))
+                return subprocess.CompletedProcess(command,0,b'',b'')
+            project.transport=transport
             with self.assertRaisesRegex(Failure,'BAD_DOWNLOAD_METADATA'):
                 project.read('/srv/test/project/demo.sv','demo.sv')
 

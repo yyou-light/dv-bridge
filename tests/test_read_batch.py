@@ -4,13 +4,11 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-TEST_TEMP=Path.cwd()/'.work/test-etx-clipboard-bridge'
-TEST_TEMP.mkdir(parents=True,exist_ok=True)
 import unittest
 
 BASE = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(BASE/'etx'), str(BASE/'local')]
-from session_protocol import Rejected, digest, request, canonical
+from session_protocol import Rejected, digest, request, canonical, MAX_TEXT_FILE
 from session_files import Files
 from session_service import Dispatcher
 from windows_read_files import read_files
@@ -18,7 +16,7 @@ from windows_read_files import read_files
 
 class BatchTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=TEST_TEMP)
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.project = self.root/'project'; self.project.mkdir()
         self.output = self.root/'output'; self.output.mkdir()
@@ -74,10 +72,14 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(result['downloaded_bytes'], 524298)
 
     def test_server_rejects_oversize_and_non_utf8(self):
-        for value in (b'x'*524289, b'\xff'):
+        for value in (b'\xff', b'text\x00binary'):
             with self.subTest(length=len(value)):
                 spec = self.spec([value], task=('%032x' % len(value)))
                 with self.assertRaises(Rejected): read_files(self.client, spec, self.output)
+        spec = self.spec([b'x'],task='f'*32)
+        with Path(spec['files'][0]['path']).open('wb') as stream:
+            stream.truncate(MAX_TEXT_FILE+1)
+        with self.assertRaises(Rejected): read_files(self.client,spec,self.output)
 
     def test_batch_limit_duplicate_paths_and_traversal(self):
         for mutate in (lambda s:s.update(files=s['files']*11),

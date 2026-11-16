@@ -72,6 +72,61 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(client.Failure,'LOCAL_REQUEST_CONFLICT'):
             self.project.prepare_submit('changed_case',1,'work01')
 
+    def test_native_log_verifies_all_fragments_before_publishing(self):
+        import base64
+        remote='/srv/test/results/demo_tb__vcs__demo_case__1_cov/stdout.log'
+        data=b'%E- synthetic failure\n'
+        value={'path':remote,'mode':'errors','identity':[1,2,len(data),3],
+            'observed_file_bytes':len(data),'bytes':len(data),'fragments':[{
+                'kind':'first_error','offset':0,'bytes':len(data),'line':1,
+                'sha256':client.sha(data),'data':base64.b64encode(data).decode()}]}
+        self.project.rpc=lambda op,args,name=None:{'native_log_enabled':True} if op=='hello' else value
+        value['fragments'][0]['sha256']='0'*64
+        with self.assertRaisesRegex(client.Failure,'NATIVE_LOG_HASH_MISMATCH'):
+            self.project.native_log(remote)
+        self.assertEqual(list(self.project.result.iterdir()),[])
+        value['fragments'][0]['sha256']=client.sha(data)
+        result=self.project.native_log(remote)
+        self.assertEqual(Path(result['fragments'][0]['local']).read_bytes(),data)
+        self.assertTrue((self.project.result/'native-log.source.json').exists())
+        value['identity']=[1,2,len(data),4]
+        with self.assertRaisesRegex(client.Failure,'LOG_CHANGED'):self.project.native_log(remote)
+
+
+    def test_old_endpoint_rejects_large_text_upgrade_before_any_upload(self):
+        source=self.root/'.private/x11/source.txt';source.parent.mkdir(parents=True,exist_ok=True)
+        source.write_bytes(b'x'*524289)
+        manifest=source.parent/'upload.json'
+        client.save(manifest,{'files':[{'source':str(source),'target':'/srv/test/project/target.txt',
+            'expected_before_sha256':'absent'}]})
+        calls=[]
+        self.project.rpc=lambda op,args,name=None:calls.append(op) or {}
+        with self.assertRaisesRegex(client.Failure,'LARGE_TEXT_ENDPOINT_UPGRADE_REQUIRED'):
+            self.project.upload(manifest)
+        self.assertEqual(calls,['hello'])
+
+    def test_small_text_upload_stays_compatible_with_old_endpoint(self):
+        source=self.root/'.private/x11/source.txt';source.parent.mkdir(parents=True,exist_ok=True)
+        raw=b'ordinary text\n';source.write_bytes(raw)
+        manifest=source.parent/'upload.json'
+        client.save(manifest,{'files':[{'source':str(source),'target':'/srv/test/project/file.txt',
+            'expected_before_sha256':'absent'}]})
+        calls=[]
+        def rpc(op,args,name=None):
+            calls.append(op)
+            if op=='hello':return {}
+            if op=='upload_begin':
+                self.assertNotIn('text_only',args)
+                return {'received':0}
+            if op=='upload_status':return {'received':0,'prefix_sha256':client.sha(b'')}
+            if op=='upload_chunk':return {'received':len(raw),'prefix_sha256':client.sha(raw)}
+            if op=='commit':return {'state':'committed','files':[]}
+            self.fail(op)
+        self.project.rpc=rpc
+        self.assertEqual(self.project.upload(manifest)['state'],'committed')
+        self.assertEqual(calls,['hello','upload_begin','upload_status','upload_chunk','commit'])
+
+
     def test_task_payload_hash_checked_before_returning_results(self):
         payload={'result':'PASS'};raw=client.json_bytes(payload)
         result={'ready':True,'payload':payload,'bytes':len(raw),'sha256':client.sha(raw)}

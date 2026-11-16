@@ -1,5 +1,7 @@
 """Ordinary-file snapshots and SHA-conditional, recoverable installations."""
 import contextlib
+import codecs
+import hashlib
 import json
 import os
 import shutil
@@ -10,7 +12,8 @@ import uuid
 from pathlib import Path
 
 from session_protocol import (Rejected, require, keys, identifier, integer, sha,
-    canonical, strict_json, digest, encode_bytes, decode_bytes, MAX_FILE, MAX_CHUNK)
+    canonical, strict_json, digest, encode_bytes, decode_bytes, MAX_FILE, MAX_CHUNK,
+    MAX_TEXT_FILE)
 
 
 def atomic_json(path, value):
@@ -111,6 +114,7 @@ class Files:
         self.root = private_directory(root)
         self.roots = [Path(p).absolute() for p in allowed_roots]
         self.write_enabled = write_enabled
+        self.upload_hashes = {}
         self.write_roots=[Path(p).absolute() for p in (
             allowed_roots if write_roots is None else write_roots)]
         self.locks = locks
@@ -170,6 +174,45 @@ class Files:
     def read_begin(self, args):
         return self._read_snapshot(args)
 
+    @staticmethod
+    def stream_file(path, limit=MAX_TEXT_FILE, text_only=False, output=None):
+        """Hash/copy an ordinary file with bounded memory and a stable identity."""
+        path = Path(path)
+        hasher = hashlib.sha256()
+        decoder = codecs.getincrementaldecoder('utf-8')() if text_only else None
+        with parent_directory(path) as parent:
+            fd = os.open(path.name if parent is not None else str(path),
+                os.O_RDONLY | getattr(os,'O_NOFOLLOW',0) | getattr(os,'O_NONBLOCK',0), dir_fd=parent)
+            with os.fdopen(fd, 'rb') as source:
+                before = os.fstat(source.fileno())
+                require(stat.S_ISREG(before.st_mode) and before.st_size <= limit, 'FILE_SIZE_OR_TYPE_REJECTED')
+                count = 0
+                while True:
+                    chunk = source.read(MAX_CHUNK)
+                    if not chunk:
+                        break
+                    count += len(chunk)
+                    require(count <= limit, 'FILE_SIZE_OR_TYPE_REJECTED')
+                    if decoder:
+                        try:
+                            require(b'\x00' not in chunk, 'TEXT_ENCODING_REJECTED')
+                            decoder.decode(chunk)
+                        except UnicodeError:
+                            raise Rejected('TEXT_ENCODING_REJECTED') from None
+                    hasher.update(chunk)
+                    if output is not None:
+                        output.write(chunk)
+                if decoder:
+                    try:
+                        decoder.decode(b'', final=True)
+                    except UnicodeError:
+                        raise Rejected('TEXT_ENCODING_REJECTED') from None
+                current = os.stat(path.name,dir_fd=parent,follow_symlinks=False) \
+                    if parent is not None else path.lstat()
+                require(count == before.st_size and Files.identity(before)
+                    == Files.identity(os.fstat(source.fileno())) == Files.identity(current), 'SOURCE_CHANGED')
+        return hasher, before
+
     def _read_snapshot(self, args, text_only=False):
         keys(args, ('path', 'transfer_id'))
         transfer = identifier(args['transfer_id'])
@@ -181,20 +224,27 @@ class Files:
                 meta = self.meta(meta_path)
                 require(meta['path'] == str(path), 'TRANSFER_CONFLICT')
                 if text_only:
-                    require(meta['bytes'] <= 524288, 'TEXT_SIZE_LIMIT')
-                    self._utf8((folder / 'data').read_bytes())
+                    require(meta['bytes'] <= MAX_TEXT_FILE, 'TEXT_SIZE_LIMIT')
+                    self.stream_file(folder/'data', text_only=True)
+                else:
+                    require(meta['bytes'] <= MAX_FILE, 'FILE_SIZE_OR_TYPE_REJECTED')
                 return meta
-            with self.scope('read'):
-                data, info = self.read(path, 524288 if text_only else MAX_FILE)
-                if text_only:
-                    self._utf8(data)
-            with (folder / 'data').open('xb') as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
+            pending = folder / 'data.pending'
+            if pending.exists() or pending.is_symlink():
+                require(not pending.is_symlink() and pending.is_file(), 'NOT_REGULAR_FILE')
+                pending.unlink()
+            try:
+                with self.scope('read'), pending.open('xb') as stream:
+                    hasher, info = self.stream_file(path, MAX_TEXT_FILE if text_only else MAX_FILE,
+                        text_only=text_only, output=stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(pending, folder / 'data')
+            finally:
+                pending.unlink(missing_ok=True)
             os.chmod(folder / 'data', 0o600)
-            meta = {'transfer_id': transfer, 'path': str(path), 'bytes': len(data),
-                'sha256': digest(data), 'identity': self.identity(info),
+            meta = {'transfer_id': transfer, 'path': str(path), 'bytes': info.st_size,
+                'sha256': hasher.hexdigest(), 'identity': self.identity(info),
                 'chunk_bytes': MAX_CHUNK}
             atomic_json(meta_path, meta)
             return meta
@@ -211,7 +261,7 @@ class Files:
         keys(args, ('files',))
         items = args['files']
         require(type(items) is list and 1 <= len(items) <= 10, 'BATCH_SIZE_LIMIT')
-        paths, transfers = set(), set()
+        paths, transfers, total = set(), set(), 0
         for item in items:
             keys(item, ('path', 'transfer_id', 'known_sha256'))
             path = self.path(item['path'])
@@ -221,6 +271,8 @@ class Files:
             require(str(path) not in paths and transfer not in transfers, 'BATCH_DUPLICATE')
             paths.add(str(path))
             transfers.add(transfer)
+            total += path.stat().st_size
+            require(total <= MAX_TEXT_FILE, 'BATCH_SIZE_LIMIT')
         remaining = 196608
         results = []
         for item in items:
@@ -252,11 +304,14 @@ class Files:
             'data': encode_bytes(data), 'complete': offset + len(data) == meta['bytes']}
 
     def upload_begin(self, args):
-        keys(args, ('transfer_id', 'path', 'bytes', 'sha256', 'expected_before_sha256'))
+        fields = ('transfer_id', 'path', 'bytes', 'sha256', 'expected_before_sha256')
+        keys(args, fields + (('text_only',) if 'text_only' in args else ()))
+        if 'text_only' in args:
+            require(args['text_only'] is True, 'TEXT_MODE_REQUIRED')
         require(self.write_enabled, 'WRITES_DISABLED')
         transfer = identifier(args['transfer_id'])
         target = self.path(args['path'], absent=True,writing=True)
-        size = integer(args['bytes'], 0, MAX_FILE)
+        size = integer(args['bytes'], 0, MAX_TEXT_FILE if args.get('text_only') else MAX_FILE)
         sha(args['sha256'])
         before = args['expected_before_sha256']
         require(before == 'absent' or (isinstance(before, str) and len(before) == 64),
@@ -281,11 +336,24 @@ class Files:
         keys(args, ('transfer_id',))
         folder = self.root / ('upload-' + identifier(args['transfer_id']))
         meta = self.meta(folder / 'meta.json')['specification']
-        data = (folder / 'data').read_bytes()
-        require(len(data) <= meta['bytes'], 'TRANSFER_CORRUPTED')
-        return {'transfer_id': args['transfer_id'], 'received': len(data),
-            'prefix_sha256': digest(data), 'complete': len(data) == meta['bytes'] and
-            digest(data) == meta['sha256']}
+        with file_lock(folder / 'lock'):
+            return self.upload_summary(folder, meta)
+
+    def upload_summary(self, folder, meta):
+        path = folder / 'data'
+        info = path.stat()
+        require(info.st_size <= meta['bytes'], 'TRANSFER_CORRUPTED')
+        cached = self.upload_hashes.get(str(folder))
+        if cached is None or cached[0] != self.identity(info):
+            hasher, info = self.stream_file(path)
+            if len(self.upload_hashes) >= 16:
+                self.upload_hashes.pop(next(iter(self.upload_hashes)))
+            self.upload_hashes[str(folder)] = (self.identity(info), hasher)
+        else:
+            hasher = cached[1]
+        return {'transfer_id':meta['transfer_id'], 'received':info.st_size,
+            'prefix_sha256':hasher.hexdigest(), 'complete':info.st_size == meta['bytes']
+            and hasher.hexdigest() == meta['sha256']}
 
     def upload_chunk(self, args):
         keys(args, ('transfer_id', 'offset', 'data', 'sha256'))
@@ -297,7 +365,9 @@ class Files:
         offset = integer(args['offset'], 0, meta['bytes'])
         require(data and offset + len(data) <= meta['bytes'], 'BAD_CHUNK_RANGE')
         with file_lock(folder / 'lock'):
-            current = (folder / 'data').stat().st_size
+            prior = self.upload_summary(folder, meta)
+            current = prior['received']
+            hasher = self.upload_hashes[str(folder)][1].copy()
             if offset < current:
                 with (folder / 'data').open('rb') as stream:
                     stream.seek(offset)
@@ -309,7 +379,9 @@ class Files:
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
-            return self.upload_status({'transfer_id': args['transfer_id']})
+                hasher.update(data)
+                self.upload_hashes[str(folder)] = (self.identity((folder/'data').stat()), hasher)
+            return self.upload_summary(folder, meta)
 
     def commit(self, args):
         keys(args, ('transaction_id', 'transfer_ids'))
@@ -340,33 +412,39 @@ class Files:
                 upload = self.root / ('upload-' + transfer)
                 spec = self.meta(upload / 'meta.json')['specification']
                 target = self.path(spec['path'], absent=True,writing=True)
-                data = (upload / 'data').read_bytes()
-                require(len(data) == spec['bytes'] and digest(data) == spec['sha256'],
+                payload_hash, payload_info = self.stream_file(upload / 'data',
+                    MAX_TEXT_FILE if spec.get('text_only') else MAX_FILE,
+                    text_only=spec.get('text_only', False))
+                require(payload_info.st_size == spec['bytes'] and payload_hash.hexdigest() == spec['sha256'],
                     'TRANSFER_INCOMPLETE')
                 require(str(target) not in [e['path'] for e in entries], 'DUPLICATE_TARGET')
-                require(sum(e['bytes'] for e in entries) + len(data) <= MAX_FILE,
+                batch_limit = MAX_TEXT_FILE if spec.get('text_only') and all(
+                    e['text_only'] for e in entries) else MAX_FILE
+                require(sum(e['bytes'] for e in entries) + spec['bytes'] <= batch_limit,
                     'BATCH_SIZE_LIMIT')
                 current = self.current_hash(target)
                 require(current == spec['expected_before_sha256'], 'BASELINE_CONFLICT')
                 before_mode = stat.S_IMODE(target.stat().st_mode) if current != 'absent' else 0o644
                 backup = str(len(entries)) + '.before'
                 if current != 'absent':
-                    original, info = self.read(target)
-                    require(digest(original) == current, 'BASELINE_CONFLICT')
+                    original_hash, info = self.stream_file(target, text_only=spec.get('text_only',False))
+                    require(original_hash.hexdigest() == current, 'BASELINE_CONFLICT')
                     if (folder/backup).exists():
-                        require(digest((folder/backup).read_bytes())==current,
+                        require(self.stream_file(folder/backup)[0].hexdigest()==current,
                             'BACKUP_HASH_MISMATCH')
                     else:
                         with (folder / backup).open('xb') as stream:
-                            stream.write(original)
+                            copied, _ = self.stream_file(target, text_only=spec.get('text_only',False), output=stream)
+                            require(copied.hexdigest() == current, 'BASELINE_CONFLICT')
                             stream.flush()
                             os.fsync(stream.fileno())
                         os.chmod(folder / backup, 0o600)
                 else:
                     info=None
                 entries.append({'path':str(target), 'transfer_id':transfer,
+                    'text_only':spec.get('text_only',False),
                     'before_sha256':current, 'after_sha256':spec['sha256'],
-                    'bytes':len(data), 'mode':before_mode, 'backup':backup,
+                    'bytes':spec['bytes'], 'mode':before_mode, 'backup':backup,
                     'before_metadata':None if info is None else {
                         'uid':info.st_uid,'gid':info.st_gid,'bytes':info.st_size,
                         'mode':stat.S_IMODE(info.st_mode),'mtime_ns':info.st_mtime_ns}})
@@ -379,11 +457,12 @@ class Files:
                 for entry in entries:
                     target = self.path(entry['path'], absent=True,writing=True)
                     require(self.current_hash(target) == entry['before_sha256'], 'BASELINE_CONFLICT')
-                    data = (self.root / ('upload-' + entry['transfer_id']) / 'data').read_bytes()
-                    require(len(data)==entry['bytes'] and digest(data)==entry['after_sha256'],
+                    payload = self.root / ('upload-' + entry['transfer_id']) / 'data'
+                    payload_hash, payload_info = self.stream_file(payload)
+                    require(payload_info.st_size==entry['bytes'] and payload_hash.hexdigest()==entry['after_sha256'],
                         'TRANSFER_CORRUPTED')
                     changed.append(entry)
-                    self.replace(target, data, entry['mode'])
+                    self.replace(target, (payload, entry['after_sha256']), entry['mode'])
                     require(self.current_hash(target) == entry['after_sha256'], 'INSTALL_VERIFY_FAILED')
                 manifest['state'] = 'committed'
                 atomic_json(manifest_path, manifest)
@@ -402,9 +481,9 @@ class Files:
                         if entry['before_sha256'] == 'absent':
                             self.remove(target)
                         else:
-                            require(digest((folder / entry['backup']).read_bytes())==
+                            require(self.stream_file(folder / entry['backup'])[0].hexdigest()==
                                 entry['before_sha256'],'BACKUP_HASH_MISMATCH')
-                            self.replace(target, (folder / entry['backup']).read_bytes(), entry['mode'])
+                            self.replace(target, (folder / entry['backup'], entry['before_sha256']), entry['mode'])
                         require(self.current_hash(target)==entry['before_sha256'],
                             'ROLLBACK_VERIFY_FAILED')
                     except Exception:
@@ -416,7 +495,7 @@ class Files:
     def verify_backups(self, manifest, folder):
         for entry in manifest['files']:
             if entry['before_sha256'] != 'absent':
-                require(digest((folder / entry['backup']).read_bytes()) == entry['before_sha256'],
+                require(self.stream_file(folder / entry['backup'])[0].hexdigest() == entry['before_sha256'],
                     'BACKUP_HASH_MISMATCH')
 
     def current_hash(self, path):
@@ -424,7 +503,15 @@ class Files:
             require(not path.is_symlink(), 'SYMLINK_REJECTED')
             return 'absent'
         require(not path.is_symlink(), 'SYMLINK_REJECTED')
-        return digest(self.read(path)[0])
+        return self.stream_file(path)[0].hexdigest()
+
+    @staticmethod
+    def write_payload(stream, data):
+        if isinstance(data, tuple):
+            copied, _ = Files.stream_file(data[0], output=stream)
+            require(copied.hexdigest() == data[1], 'TRANSFER_CORRUPTED')
+        else:
+            stream.write(data)
 
     @staticmethod
     def replace(target, data, mode):
@@ -435,7 +522,7 @@ class Files:
                     0o600,dir_fd=parent)
                 try:
                     with os.fdopen(fd,'wb') as stream:
-                        stream.write(data)
+                        Files.write_payload(stream, data)
                         stream.flush()
                         if target.exists():
                             info=os.stat(target.name,dir_fd=parent,follow_symlinks=False)
@@ -454,7 +541,7 @@ class Files:
         fd, temporary = tempfile.mkstemp(prefix='.etx-install-', dir=str(target.parent))
         try:
             with os.fdopen(fd, 'wb') as stream:
-                stream.write(data)
+                Files.write_payload(stream, data)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.chmod(temporary, mode)
@@ -498,19 +585,20 @@ class Files:
             entries=[]
             for index,entry in enumerate(installed['files']):
                 target=self.path(entry['path'],writing=True)
-                data,info=self.read(target)
-                require(digest(data)==entry['after_sha256'],'BASELINE_CONFLICT')
+                target_hash,info=self.stream_file(target)
+                require(target_hash.hexdigest()==entry['after_sha256'],'BASELINE_CONFLICT')
                 backup=str(index)+'.before'
                 if (folder/backup).exists():
-                    require(digest((folder/backup).read_bytes())==digest(data),
+                    require(self.stream_file(folder/backup)[0].hexdigest()==target_hash.hexdigest(),
                         'BACKUP_HASH_MISMATCH')
                 else:
                     with (folder/backup).open('xb') as stream:
-                        stream.write(data)
+                        copied,_=self.stream_file(target,output=stream)
+                        require(copied.hexdigest()==entry['after_sha256'],'BASELINE_CONFLICT')
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.chmod(folder/backup,0o600)
-                entries.append({'path':str(target),'before_sha256':digest(data),
+                entries.append({'path':str(target),'before_sha256':target_hash.hexdigest(),
                     'after_sha256':entry['before_sha256'],'backup':backup,
                     'original_backup':entry['backup'],'mode':entry['mode'],
                     'before_mode':stat.S_IMODE(info.st_mode),
@@ -529,7 +617,7 @@ class Files:
                     if entry['after_sha256']=='absent':
                         self.remove(target)
                     else:
-                        self.replace(target,(source/entry['original_backup']).read_bytes(),entry['mode'])
+                        self.replace(target,(source/entry['original_backup'],entry['after_sha256']),entry['mode'])
                     require(self.current_hash(target)==entry['after_sha256'],'INSTALL_VERIFY_FAILED')
                 manifest['state']='committed'
                 atomic_json(manifest_path,manifest)
@@ -543,9 +631,9 @@ class Files:
                         if current==entry['before_sha256']:
                             continue
                         require(current==entry['after_sha256'],'BASELINE_CONFLICT')
-                        data=(folder/entry['backup']).read_bytes()
-                        require(digest(data)==entry['before_sha256'],'BACKUP_HASH_MISMATCH')
-                        self.replace(target,data,entry['before_mode'])
+                        require(self.stream_file(folder/entry['backup'])[0].hexdigest()==
+                            entry['before_sha256'],'BACKUP_HASH_MISMATCH')
+                        self.replace(target,(folder/entry['backup'],entry['before_sha256']),entry['before_mode'])
                         require(self.current_hash(target)==entry['before_sha256'],'ROLLBACK_VERIFY_FAILED')
                     except Exception:
                         rollback_ok=False

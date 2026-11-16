@@ -334,6 +334,16 @@ class ProjectTransferTests(FileFixture,unittest.TestCase):
         downloader=Project(client_root,uid(31))
         downloader.rpc=lambda op,args,name=None:dispatcher.dispatch(request(uid(1),op,args,
             downloader.sub_id(name) if name else None,now=100))
+        def text_transport(command):
+            from windows_read_files import read_files
+            class Adapter:
+                def call(self,op,args,rid):
+                    return dispatcher.dispatch(request(uid(1),op,args,rid,now=100))
+            spec=Files.meta(Path(command[command.index('-SessionRequest')+1]))
+            value=read_files(Adapter(),spec,downloader.result)
+            atomic_json(downloader.result/'summary.json',{'ok':True,'result':value})
+            return subprocess.CompletedProcess(command,0,b'',b'')
+        downloader.transport=text_transport
         output=downloader.read(str(target),'download.bin')
         self.assertEqual(Path(output['path']).read_bytes(),data)
 

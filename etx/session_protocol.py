@@ -18,11 +18,13 @@ MAX_WIRE = 786432
 MAX_PLAIN = 524288
 MAX_CHUNK = 262144
 MAX_FILE = 16777216
+MAX_TEXT_FILE = 256 * 1024 * 1024
+MAX_SESSION_STORAGE = 2 * 1024 * 1024 * 1024
 MAX_SESSION = 28800
 MAX_REQUEST_LIFE = 120
 ID = re.compile(r'[0-9a-f]{32}\Z')
 SHA = re.compile(r'[0-9a-f]{64}\Z')
-OPS = frozenset(('hello', 'close', 'read_batch', 'read_begin', 'read_chunk', 'read_log', 'search',
+OPS = frozenset(('hello', 'close', 'read_batch', 'read_begin', 'read_chunk', 'read_log', 'native_log', 'search',
     'upload_begin', 'upload_chunk', 'upload_status', 'commit', 'restore', 'receipt',
     'workers', 'submit_simmer', 'status', 'status_many', 'submit_task', 'task_result', 'release_selftests'))
 

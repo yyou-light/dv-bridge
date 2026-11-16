@@ -5,6 +5,8 @@ IDs. An uncertain dispatch is queried or retried with the same identity.
 """
 import argparse
 import base64
+import codecs
+import stat
 import hashlib
 import importlib.util
 import json
@@ -20,6 +22,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'etx'))
 from site_config import site,configure,release_files
 
 MAX_FILE=16777216
+MAX_TEXT_FILE=256*1024*1024
 CHUNK=262144
 PINNED_SIM=None
 POWERSHELL=r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -69,6 +72,41 @@ def under(path,root):
     check(path.is_relative_to(root) and path!=root,'LOCAL_PATH_REJECTED')
     check(all(not p.is_symlink() for p in [path,*path.parents]),'LOCAL_SYMLINK_REJECTED')
     return path
+
+
+def text_file_meta(path):
+    path=Path(path)
+    for parent in (path,*path.parents):
+        info=parent.lstat()
+        check(not stat.S_ISLNK(info.st_mode) and not
+            (getattr(info,'st_file_attributes',0)&0x400),'LOCAL_SYMLINK_REJECTED')
+    before=path.stat()
+    check(stat.S_ISREG(before.st_mode) and before.st_size<=MAX_TEXT_FILE,'TEXT_SOURCE_REJECTED')
+    hasher=hashlib.sha256();decoder=codecs.getincrementaldecoder('utf-8')();count=0
+    try:
+        with path.open('rb') as stream:
+            for part in iter(lambda:stream.read(CHUNK),b''):
+                count+=len(part)
+                check(count<=MAX_TEXT_FILE and b'\x00' not in part,'TEXT_SOURCE_REJECTED')
+                decoder.decode(part);hasher.update(part)
+            decoder.decode(b'',final=True)
+            after=os.fstat(stream.fileno())
+    except UnicodeError:
+        raise Failure('TEXT_ENCODING_REJECTED') from None
+    identity=lambda info:[info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns]
+    check(count==before.st_size and identity(before)==identity(after)==identity(path.stat()),
+        'LOCAL_SOURCE_CHANGED')
+    return {'bytes':count,'sha256':hasher.hexdigest(),'identity':identity(before)}
+
+
+def save_bytes(path,data):
+    path=Path(path);temporary=path.with_name('.'+path.name+'.'+uuid.uuid4().hex)
+    try:
+        with temporary.open('xb') as stream:
+            stream.write(data);stream.flush();os.fsync(stream.fileno())
+        os.replace(temporary,path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class Project:
@@ -197,10 +235,39 @@ class Project:
         check(completed.returncode==0 and reply.get('ok'),reply.get('error','PAIRING_FAILED'))
         return reply['result']
 
+    def read_text(self,remote,name):
+        check(re.fullmatch(r'[A-Za-z0-9_.-]{1,120}',name) and name not in ('.','..'),'BAD_OUTPUT_NAME')
+        request_file=self.requests/'files.json'
+        specification={'id':self.operation_id,'files':[{'path':remote,'cached_file':None,
+            'cached_sha256':None,'output_name':name}],'timeout_seconds':3600}
+        if request_file.exists():check(read_json(request_file)==specification,'LOCAL_REQUEST_CONFLICT')
+        else:save(request_file,specification)
+        command=[POWERSHELL,'-NoProfile','-STA','-ExecutionPolicy','Bypass','-File',
+            str(self.root/'clients/Invoke-EtxX11.ps1'),'-Mode','SessionReadFiles',
+            '-SessionConfig',str(self.config),'-SessionRequest',str(request_file),
+            '-SessionOutputName',self.operation_id+'/summary.json','-TimeoutSeconds','3600']
+        completed=self.transport(command)
+        response=self.result/'summary.json'
+        check(response.is_file(),'TRANSPORT_RECEIPT_MISSING')
+        reply=read_json(response)
+        check(completed.returncode==0 and reply.get('ok'),reply.get('error','TRANSPORT_FAILED'))
+        files=reply.get('result',{}).get('files')
+        check(type(files) is list and len(files)==1,'BAD_DOWNLOAD_METADATA')
+        meta=files[0]
+        check(meta.get('path')==remote and type(meta.get('bytes')) is int and
+            0<=meta['bytes']<=MAX_TEXT_FILE,'BAD_DOWNLOAD_METADATA')
+        output=under(meta['local'],self.result)
+        check(output==self.result/name,'BAD_DOWNLOAD_METADATA')
+        local=text_file_meta(output)
+        check((local['bytes'],local['sha256'])==(meta['bytes'],meta['sha256']),'DOWNLOAD_HASH_MISMATCH')
+        return {'path':str(output),'bytes':meta['bytes'],'sha256':meta['sha256'],
+            'retention':meta.get('retention','baseline')}
+
     def read(self,remote,name):
         extension=Path(remote).suffix.lower()
         check(extension in DOCUMENT_TYPES|TEXT_TYPES,'UNSUPPORTED_FILE_TYPE')
-        limit=MAX_FILE if extension in DOCUMENT_TYPES else 524288
+        if extension not in DOCUMENT_TYPES:return self.read_text(remote,name)
+        limit=MAX_FILE
         check(re.fullmatch(r'[A-Za-z0-9_.-]{1,120}',name) and name not in ('.','..'),
             'BAD_OUTPUT_NAME')
         meta=self.rpc('read_begin',{'path':remote,'transfer_id':self.operation_id},'read-begin')
@@ -252,14 +319,17 @@ class Project:
         for index,item in enumerate(manifest['files']):
             check(set(item)=={'source','target','expected_before_sha256'},'BAD_UPLOAD_MANIFEST')
             source=under(item['source'],self.root/'.private/x11')
-            check(source.is_file() and source.stat().st_size<=524288,'UPLOAD_SOURCE_REJECTED')
-            data=source.read_bytes()
-            try:data.decode('utf-8')
-            except UnicodeDecodeError:raise Failure('UTF8_TEXT_REQUIRED') from None
-            total+=len(data)
-            check(total<=MAX_FILE,'BATCH_SIZE_LIMIT')
-            prepared.append(dict(item,bytes=len(data),sha256=sha(data),
+            metadata=text_file_meta(source)
+            total+=metadata['bytes']
+            check(total<=MAX_TEXT_FILE,'BATCH_SIZE_LIMIT')
+            prepared.append(dict(item,bytes=metadata['bytes'],sha256=metadata['sha256'],
+                source_identity=metadata['identity'],
                 transfer_id=self.sub_id('upload-'+str(index))))
+        capabilities=self.rpc('hello',{})
+        text_mode=capabilities.get('large_text_upload_enabled') is True
+        limit=capabilities.get('max_text_file_bytes',0) if text_mode else 524288
+        check(max(p['bytes'] for p in prepared)<=limit and (text_mode or total<=MAX_FILE),
+            'LARGE_TEXT_ENDPOINT_UPGRADE_REQUIRED')
         specification={'transaction_id':self.operation_id,'files':prepared}
         prepared_path=self.requests/'upload-specification.json'
         if prepared_path.exists():
@@ -267,31 +337,122 @@ class Project:
         else:
             save(prepared_path,specification)
         for index,item in enumerate(prepared):
-            data=Path(item['source']).read_bytes()
-            check(sha(data)==item['sha256'],'UPLOAD_SOURCE_CHANGED')
+            source=Path(item['source'])
+            check(text_file_meta(source)=={'bytes':item['bytes'],'sha256':item['sha256'],
+                'identity':item['source_identity']},'UPLOAD_SOURCE_CHANGED')
             transfer=item['transfer_id']
             self.rpc('upload_begin',{'transfer_id':transfer,'path':item['target'],
                 'bytes':item['bytes'],'sha256':item['sha256'],
-                'expected_before_sha256':item['expected_before_sha256']},'upload-begin-'+str(index))
+                'expected_before_sha256':item['expected_before_sha256'],**({'text_only':True} if text_mode else {})},'upload-begin-'+str(index))
             current=self.rpc('upload_status',{'transfer_id':transfer})
             offset=current['received']
-            check(0<=offset<=len(data) and sha(data[:offset])==current['prefix_sha256'],
-                'UPLOAD_PREFIX_MISMATCH')
-            while offset<len(data):
-                part=data[offset:offset+CHUNK]
-                reply=self.rpc('upload_chunk',{'transfer_id':transfer,'offset':offset,
-                    'data':base64.b64encode(part).decode('ascii'),'sha256':sha(part)},
-                    'upload-chunk-{}-{}'.format(index,offset))
-                expected=offset+len(part)
-                check(reply['received']==expected and reply['prefix_sha256']==sha(data[:expected]),
-                    'UPLOAD_ACK_INVALID')
-                offset=expected
+            check(type(offset) is int and 0<=offset<=item['bytes'],'UPLOAD_PREFIX_MISMATCH')
+            hasher=hashlib.sha256()
+            with source.open('rb') as stream:
+                remaining=offset
+                while remaining:
+                    part=stream.read(min(CHUNK,remaining))
+                    check(bool(part),'UPLOAD_SOURCE_CHANGED')
+                    hasher.update(part);remaining-=len(part)
+                check(hasher.hexdigest()==current['prefix_sha256'],'UPLOAD_PREFIX_MISMATCH')
+                while offset<item['bytes']:
+                    part=stream.read(min(CHUNK,item['bytes']-offset))
+                    check(bool(part),'UPLOAD_SOURCE_CHANGED')
+                    hasher.update(part)
+                    reply=self.rpc('upload_chunk',{'transfer_id':transfer,'offset':offset,
+                        'data':base64.b64encode(part).decode('ascii'),'sha256':sha(part)},
+                        'upload-chunk-{}-{}'.format(index,offset))
+                    expected=offset+len(part)
+                    check(reply['received']==expected and reply['prefix_sha256']==hasher.hexdigest(),
+                        'UPLOAD_ACK_INVALID')
+                    offset=expected
+                check(not stream.read(1) and hasher.hexdigest()==item['sha256'],'UPLOAD_SOURCE_CHANGED')
+            check(text_file_meta(source)['identity']==item['source_identity'],'UPLOAD_SOURCE_CHANGED')
         receipt=self.rpc('commit',{'transaction_id':self.operation_id,
             'transfer_ids':[p['transfer_id'] for p in prepared]},'commit')
         check(receipt['state']=='committed','INSTALL_NOT_COMMITTED')
         save(self.result/'install.json',receipt)
+        return receipt
+
+    def native_log(self,remote,mode='errors',offset=0,limit=CHUNK):
+        check(mode in ('errors','range','tail') and type(offset) is int and offset>=0
+            and type(limit) is int and 1<=limit<=CHUNK,'BAD_NATIVE_LOG_OPTIONS')
+        capabilities=self.rpc('hello',{})
+        check(capabilities.get('native_log_enabled') is True,'NATIVE_LOG_ENDPOINT_UPGRADE_REQUIRED')
+        source_file=self.result/'native-log.source.json'
+        source=read_json(source_file) if source_file.exists() else None
+        check(source is None or source['path']==remote,'LOCAL_LOG_SOURCE_CONFLICT')
+        name='native-log-{}-{}-{}'.format(mode,offset,limit)
+        request_file=self.requests/(self.sub_id(name)+'.json')
+        arguments={'path':remote,'mode':mode,'offset':offset,'limit':limit,
+            'identity':source['identity'] if source else None}
+        if request_file.exists():
+            old=read_json(request_file)['args']
+            check(all(old[key]==arguments[key] for key in ('path','mode','offset','limit')),
+                'LOCAL_REQUEST_CONFLICT')
+            arguments=old
+        value=self.rpc('native_log',arguments,name)
+        check(value['path']==remote and value['mode']==mode and type(value['fragments']) is list
+            and len(value['fragments'])<=2,'NATIVE_LOG_REPLY_INVALID')
+        check(source is None or value['identity']==source['identity'],'LOG_CHANGED')
+        check(type(value.get('identity')) is list and len(value['identity'])==4 and
+            all(type(v) is int and v>=0 for v in value['identity']) and
+            type(value.get('observed_file_bytes')) is int and 0<=value['observed_file_bytes']<=MAX_TEXT_FILE,
+            'NATIVE_LOG_REPLY_INVALID')
+        total=0;outputs=[];kinds=set()
+        for index,fragment in enumerate(value['fragments']):
+            data=base64.b64decode(fragment['data'],validate=True)
+            check(fragment['kind'] in ('range','tail','first_error') and fragment['kind'] not in kinds
+                and fragment['bytes']==len(data)
+                and sha(data)==fragment['sha256'],'NATIVE_LOG_HASH_MISMATCH')
+            kinds.add(fragment['kind'])
+            total+=len(data);check(total<=limit,'NATIVE_LOG_REPLY_INVALID')
+            try: data.decode('utf-8')
+            except UnicodeError: raise Failure('TEXT_ENCODING_REJECTED') from None
+            check(type(fragment['offset']) is int and fragment['offset']>=0
+                and fragment['offset']+len(data)<=value['observed_file_bytes'],'NATIVE_LOG_REPLY_INVALID')
+            output=under(self.result/('native-log-'+fragment['kind']+'-'+str(offset)+'.txt'),self.result)
+            outputs.append((output,data,{k:v for k,v in fragment.items() if k!='data'}))
+        check(total==value['bytes'],'NATIVE_LOG_REPLY_INVALID')
+        # Publish only after all fragment hashes and ranges have passed.
+        for output,data,fragment in outputs: save_bytes(output,data)
+        save(source_file,{'path':remote,'identity':value['identity'],'bytes':value['observed_file_bytes']})
+        result={k:v for k,v in value.items() if k!='fragments'}
+        result['fragments']=[dict(fragment,local=str(output)) for output,data,fragment in outputs]
+        save(self.result/('native-log-'+mode+'-'+str(offset)+'.json'),result)
+        return result
+
+
+    def cleanup_logs(self,summary_name='summary.json'):
+        check(re.fullmatch(r'[A-Za-z0-9_.-]+\.json',summary_name) is not None,'BAD_SUMMARY_NAME')
+        summary_file=under(self.result/summary_name,self.result)
+        summary=read_json(summary_file)
+        check(summary.get('ok') is True and type(summary.get('result',{}).get('files')) is list,
+            'BAD_LOG_SUMMARY')
+        pending=[]
+        for entry in summary['result']['files']:
+            if not entry['path'].endswith('.log') or entry.get('retention')!='temporary_log':
+                continue
+            path=under(entry['local'],self.result)
+            if entry.get('retained') is False:
+                check(not path.exists(),'LOCAL_OUTPUT_CONFLICT')
+                continue
+            metadata=text_file_meta(path)
+            check((metadata['bytes'],metadata['sha256'])==(entry['bytes'],entry['sha256']),
+                'LOCAL_LOG_CHANGED')
+            pending.append((path,entry))
+        for path,entry in pending:
+            metadata=text_file_meta(path)
+            check((metadata['bytes'],metadata['sha256'])==(entry['bytes'],entry['sha256']),
+                'LOCAL_LOG_CHANGED')
+            path.unlink()
+            entry['retained']=False
+        save(summary_file,summary)
+        return {'removed_files':len(pending),'removed_bytes':sum(entry['bytes'] for path,entry in pending),
+            'summary':str(summary_file)}
         return {'transaction_id':self.operation_id,'receipt':str(self.result/'install.json'),
             'state':'committed','files':len(prepared)}
+
 
     def prepare_submit(self,case,seed,profile=None,worker_id=None,workers=None):
         path=self.requests/'simulation.json'
@@ -469,6 +630,10 @@ def main():
     logs=commands.add_parser('logs'); logs.add_argument('--request-id',required=True)
     logs.add_argument('--stream',choices=('stdout','stderr'),default='stdout')
     search=commands.add_parser('search'); search.add_argument('--root',required=True); search.add_argument('--pattern',required=True)
+    native=commands.add_parser('native-log'); native.add_argument('--remote',required=True)
+    native.add_argument('--mode',choices=('errors','range','tail'),default='errors')
+    native.add_argument('--offset',type=int,default=0); native.add_argument('--limit',type=int,default=CHUNK)
+    cleanup=commands.add_parser('cleanup-logs'); cleanup.add_argument('--summary',default='summary.json')
     args=parser.parse_args()
     started=time.perf_counter()
     try:
@@ -496,6 +661,8 @@ def main():
         elif args.command=='restore': result=project.rpc('restore',{
             'transaction_id':args.transaction_id,'restoration_id':args.operation_id},'restore')
         elif args.command=='logs': result=project.logs(args.request_id,args.stream)
+        elif args.command=='native-log': result=project.native_log(args.remote,args.mode,args.offset,args.limit)
+        elif args.command=='cleanup-logs': result=project.cleanup_logs(args.summary)
         else:
             value=project.rpc('search',{'root':args.root,'pattern':args.pattern})
             data=base64.b64decode(value.pop('data'),validate=True)
