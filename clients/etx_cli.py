@@ -24,6 +24,7 @@ from site_config import site,configure,release_files
 MAX_FILE=16777216
 MAX_TEXT_FILE=256*1024*1024
 CHUNK=262144
+UPLOAD_CHUNK=32768
 PINNED_SIM=None
 POWERSHELL=r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
 BATCH_OPERATIONS={'workers','status','status_many','task_result','submit_simmer','submit_task'}
@@ -134,10 +135,18 @@ class Project:
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=3600,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
         sample={'outer_seconds':round(time.perf_counter()-started,6)}
+        completed.etx_queue_error=None
         for line in completed.stdout.decode('utf-8',errors='replace').splitlines():
             if line.startswith('ETX_CONSUMER_TIMINGS='):
                 try: sample['consumer']=json.loads(line.split('=',1)[1])
                 except ValueError: pass
+            elif line.startswith('ETX_QUEUE_ERROR='):
+                try:
+                    error=json.loads(line.split('=',1)[1])
+                    if error.get('not_sent') is True:
+                        completed.etx_queue_error=error.get('error','ETX_QUEUE_LOCAL_ERROR')
+                        sample['queue_error']=error
+                except (ValueError,AttributeError): pass
         self.transport_samples.append(sample)
         return completed
 
@@ -158,6 +167,7 @@ class Project:
         # This small file is a transport receipt. It may be refreshed for status;
         # durable business IDs remain in the request and ETX receipt.
         completed=self.transport(command)
+        check(not getattr(completed,'etx_queue_error',None),getattr(completed,'etx_queue_error',None))
         check(response.is_file(),'TRANSPORT_RECEIPT_MISSING')
         reply=read_json(response)
         check(completed.returncode==0 and reply.get('ok'),reply.get('error','TRANSPORT_FAILED'))
@@ -198,6 +208,8 @@ class Project:
             '-SessionConfig',str(self.config),'-SessionRequest',str(path),
             '-SessionOutputName',self.operation_id+'/'+aggregate.name]
         completed=self.transport(command)
+        if completed.returncode not in (0,2):
+            check(not getattr(completed,'etx_queue_error',None),getattr(completed,'etx_queue_error',None))
         check(completed.returncode in (0,2) and aggregate.is_file(),'BATCH_TRANSPORT_FAILED')
         reply=read_json(aggregate)
         self.transport_samples[-1]['consumer']=reply.get('timings',{})
@@ -230,6 +242,7 @@ class Project:
             '-File',str(self.root/'clients/Invoke-EtxX11.ps1'),'-Mode','SessionPair',
             '-SessionConfig',str(self.config),'-Fingerprint',fingerprint,
             '-SessionOutputName',self.operation_id+'/pair.json'])
+        check(not getattr(completed,'etx_queue_error',None),getattr(completed,'etx_queue_error',None))
         check(response.exists(),'TRANSPORT_RECEIPT_MISSING')
         reply=read_json(response)
         check(completed.returncode==0 and reply.get('ok'),reply.get('error','PAIRING_FAILED'))
@@ -356,12 +369,21 @@ class Project:
                     hasher.update(part);remaining-=len(part)
                 check(hasher.hexdigest()==current['prefix_sha256'],'UPLOAD_PREFIX_MISMATCH')
                 while offset<item['bytes']:
-                    part=stream.read(min(CHUNK,item['bytes']-offset))
-                    check(bool(part),'UPLOAD_SOURCE_CHANGED')
+                    chunk_name='upload-chunk-{}-{}'.format(index,offset)
+                    pending=self.requests/(self.sub_id(chunk_name)+'.json')
+                    length=min(UPLOAD_CHUNK,item['bytes']-offset)
+                    if pending.exists():
+                        # Preserve the exact chunk already prepared by an earlier
+                        # version. rpc still checks the full immutable request.
+                        old=read_json(pending)['args']['data']
+                        check(isinstance(old,str) and len(old)<=((CHUNK+2)//3)*4,'LOCAL_REQUEST_CONFLICT')
+                        length=len(base64.b64decode(old,validate=True))
+                        check(0<length<=min(CHUNK,item['bytes']-offset),'LOCAL_REQUEST_CONFLICT')
+                    part=stream.read(length)
+                    check(len(part)==length,'UPLOAD_SOURCE_CHANGED')
                     hasher.update(part)
                     reply=self.rpc('upload_chunk',{'transfer_id':transfer,'offset':offset,
-                        'data':base64.b64encode(part).decode('ascii'),'sha256':sha(part)},
-                        'upload-chunk-{}-{}'.format(index,offset))
+                        'data':base64.b64encode(part).decode('ascii'),'sha256':sha(part)},chunk_name)
                     expected=offset+len(part)
                     check(reply['received']==expected and reply['prefix_sha256']==hasher.hexdigest(),
                         'UPLOAD_ACK_INVALID')

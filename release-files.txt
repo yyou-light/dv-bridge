@@ -5,6 +5,7 @@ AGENTS.md
 README.md
 VERSION
 clients/Invoke-EtxX11.ps1
+clients/EtxTransportQueue.ps1
 clients/common.py
 clients/etx_cli.py
 clients/xverif_client.py
@@ -39,6 +40,7 @@ tests/test_portable_configuration.py
 tests/test_read_batch.py
 tests/test_session.py
 tests/test_session_client.py
+tests/test_transport_queue.py
 worker-runtime/fsdb_access.py
 worker-runtime/sim_control.py
 worker-runtime/simmer_launch.py

@@ -20,7 +20,7 @@ from pathlib import Path
 from site_config import site, configure
 
 from session_protocol import (Crypto, Rejected, require, canonical, strict_json,
-    digest, MAX_SESSION, MAGIC,is_frame,normalize_frame,identifier)
+    digest, MAX_SESSION, MAGIC,is_frame,normalize_frame,identifier,validate_request)
 from session_files import Files, private_directory, file_lock, atomic_json
 from session_service import Dispatcher
 
@@ -119,6 +119,19 @@ def identity_files(config):
     require(crypto.fingerprint(config['trusted_client_cert'])==
         crypto.fingerprint(config['client_recipient_cert']),'CLIENT_IDENTITY_MISMATCH')
     return crypto
+
+
+def reply_still_current(selection, message, wire, dispatcher):
+    # Read may block. Recheck expiry after it returns, including cached replies.
+    # This is a local guard, not an atomic X ownership or ETX proxy fence.
+    current = selection.read()
+    now = time.time()
+    try:
+        validate_request(message, message.get('session'), now)
+        require(now <= dispatcher.expires, 'SESSION_EXPIRED')
+    except Rejected:
+        return False, current
+    return is_frame(current) and normalize_frame(current) == wire, current
 
 
 class Selection:
@@ -419,7 +432,7 @@ def serve(config, config_path, pause_requested, generation=0):
             stop_signal=number
         signal.signal(signal.SIGINT,stopped)
         signal.signal(signal.SIGTERM,stopped)
-        last_request=None
+        seen_wire_expiries={}
         last_response=None
         selection=Selection(config['display'])
         print('ETX_SESSION_READY session='+session,flush=True)
@@ -463,20 +476,31 @@ def serve(config, config_path, pause_requested, generation=0):
                 time.sleep(0.1)
                 continue
             wire_hash=digest(text.encode('utf-8'))
-            if wire_hash==last_request and last_response:
-                selection.write(last_response)
+            # One publication attempt per authenticated transport frame. ETX
+            # echoing the same frame must not create a reply feedback loop.
+            if wire_hash in seen_wire_expiries:
                 time.sleep(0.1)
                 continue
             try:
                 message=crypto.open(text,allow_signed_hello=True)
+                validate_request(message,message.get('session'),time.time())
+                require(time.time()<=dispatcher.expires,'SESSION_EXPIRED')
             except Rejected as exc:
                 if last_rejected!=wire_hash:
                     print('ETX_SESSION_FRAME_ERROR='+exc.code,flush=True)
                     last_rejected=wire_hash
                 time.sleep(0.1)
                 continue
+            now=time.time()
+            seen_wire_expiries={key:expires for key,expires in seen_wire_expiries.items()
+                if expires>=now}
+            if len(seen_wire_expiries)>=4096:
+                time.sleep(0.1)
+                continue
+            seen_wire_expiries[wire_hash]=message['expires']
             response={'v':1,'id':message.get('id'),'session':message.get('session'),
-                'expires':int(time.time())+120}
+                'request_sha256':wire_hash,
+                'expires':min(int(time.time())+120,message['expires'],int(dispatcher.expires))}
             try:
                 if pause:
                     pause.check()
@@ -492,12 +516,11 @@ def serve(config, config_path, pause_requested, generation=0):
             except Exception:
                 response.update(ok=False,error='INTERNAL_ERROR')
             last_response=crypto.seal(response,advertise_cert=message.get('op')=='hello')
-            last_request=wire_hash
             # A user may copy ordinary text while an operation is processing.
             # Keep the durable result for a same-ID retry; do not overwrite it.
-            current=selection.read()
+            publish,current=reply_still_current(selection,message,text,dispatcher)
             published=False
-            if is_frame(current) and normalize_frame(current)==text:
+            if publish:
                 selection.write(last_response)
                 published=True
             current_kind='none' if current is None else 'protocol' if is_frame(current) else 'ordinary'

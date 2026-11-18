@@ -475,6 +475,7 @@ class CryptoAndExchangeTests(unittest.TestCase):
                 if value and value.startswith(MAGIC):
                     incoming=peer.crypto.open(value,allow_signed_hello=True)
                     response={'v':1,'id':incoming['id'],'session':incoming['session'],
+                        'request_sha256':digest(normalize_frame(value).encode('ascii')),
                         'expires':int(clock.now())+120}
                     try:
                         response.update(ok=True,result=peer.dispatcher.dispatch(incoming))
@@ -500,10 +501,13 @@ class CryptoAndExchangeTests(unittest.TestCase):
             self.assertEqual(peer.value,'original user text')
             self.assertEqual(client.session,uid(1))
             args={'request_id':uid(30)}
+            with self.assertRaisesRegex(Rejected,'RPC_TIMEOUT_QUERY_SAME_ID'):
+                client.call('submit_simmer',args,uid(31))
+            self.assertEqual(worker.executions,1)
             reply=client.call('submit_simmer',args,uid(31))
             self.assertEqual(reply['state'],'running')
             self.assertEqual(worker.executions,1)
-            self.assertGreaterEqual(clock.now(),1005)
+            self.assertGreaterEqual(clock.now(),1030)
             peer.dispatcher=Dispatcher(root/'rpc',files,uid(2),worker,now=clock.now)
             reconnected=Client(config,peer,now=clock.now,sleep=clock.sleep)
             self.assertEqual(reconnected.call('submit_simmer',args,uid(31)),reply)
@@ -530,16 +534,18 @@ class CryptoAndExchangeTests(unittest.TestCase):
                     message=server.open(value,allow_signed_hello=True)
                     board.requests.append(message)
                     response={'v':1,'id':message['id'],'session':message['session'],
+                        'request_sha256':digest(normalize_frame(value).encode('ascii')),
                         'expires':int(clock.now())+120,'ok':True,
                         'result':{'session':uid(40),'expires':int(clock.now())+3600}}
                     if len(board.requests)==1:
                         response.update(id=uid(90),session=uid(91),expires=999)
                     board.value=server.seal(response,advertise_cert=True).replace(MAGIC,MAGIC_CRLF,1)
+            def sequence(board):return len(board.requests)
         old_reply=server.seal({'v':1,'id':uid(90),'session':uid(91),'expires':999,
             'ok':True,'result':{}},advertise_cert=True)
-        for baseline,expected,recovered in (('original user text','original user text',False),
-                (old_reply,None,True)):
-            with self.subTest(protocol_residue=recovered),temporary_directory() as temporary:
+        for baseline in ('original user text',old_reply):
+            clock.value=1000
+            with self.subTest(protocol_residue=baseline==old_reply),temporary_directory() as temporary:
                 root=Path(temporary)
                 board=Board(baseline)
                 client=Client({'signer_cert':str(self.root/'client.pem'),
@@ -548,10 +554,11 @@ class CryptoAndExchangeTests(unittest.TestCase):
                 client.hello(server.fingerprint(self.root/'server.pem'))
                 self.assertEqual(client.session,uid(40))
                 self.assertEqual(len(board.requests),2)
-                self.assertEqual(board.requests[0],board.requests[1])
-                self.assertEqual(board.value,expected)
+                self.assertEqual(board.requests[0]['id'],board.requests[1]['id'])
+                self.assertGreaterEqual(board.requests[1]['issued']-board.requests[0]['issued'],30)
+                self.assertIsNone(board.value)
                 self.assertTrue(client.clipboard_restored)
-                self.assertEqual(client.protocol_baseline_recovered,recovered)
+                self.assertTrue(client.protocol_baseline_recovered)
 
     def test_maximum_chunk_crypto_roundtrip(self):
         client,server=self.crypt('client','server'),self.crypt('server','client')
@@ -596,6 +603,7 @@ class InterruptionRetryTests(FileFixture,unittest.TestCase):
             value='original user text'
             generation=0
             image=object()
+            unsupported=object()
             interrupt_attempts=set()
             copy_at_resume_snapshot=False
             copy_at_restore=False
@@ -607,22 +615,27 @@ class InterruptionRetryTests(FileFixture,unittest.TestCase):
                 board.generation+=1
             def read(board):
                 board.read_times.append(clock.now())
-                require(board.value is not board.image,'CLIPBOARD_NOT_PLAIN_TEXT')
+                require(board.value not in (board.image,board.unsupported),'CLIPBOARD_NOT_PLAIN_TEXT')
+                board.last_read_sequence=board.generation
                 return board.value
             def snapshot(board):
                 if board.copy_at_resume_snapshot and board.writes and clock.now()>=1030:
                     board.copy_at_resume_snapshot=False
                     board.user_copy('copy at resume boundary')
-                return {'text':board.read(),'sequence':board.sequence()}
+                text=None if board.value is board.image else board.read()
+                return {'text':text,'sequence':board.sequence(),'image':board.value is board.image}
             def write(board,value,expected=None,compare=False,expected_sequence=None):
-                require(not compare or board.value==expected,'CLIPBOARD_USER_CHANGED')
+                current=None if board.value is board.image and expected_sequence is not None else board.value
+                require(not compare or current==expected,'CLIPBOARD_USER_CHANGED')
                 require(expected_sequence is None or board.sequence()==expected_sequence,
                     'CLIPBOARD_USER_CHANGED')
                 board.user_copy(value)
+                board.last_write_sequence=board.generation
                 if not is_frame(value):return
                 incoming=wire.open(value)
                 board.writes.append((clock.now(),incoming))
                 response={'v':1,'id':incoming['id'],'session':incoming['session'],
+                    'request_sha256':digest(normalize_frame(value).encode('ascii')),
                     'expires':int(clock.now())+120,'ok':True,
                     'result':dispatcher.dispatch(incoming)}
                 attempt=len(board.writes)
@@ -630,12 +643,14 @@ class InterruptionRetryTests(FileFixture,unittest.TestCase):
                     board.user_copy('user copy '+str(attempt))
                 else:
                     board.user_copy(wire.seal(response))
-            def restore(board,saved,expected):
+            def restore(board,saved,expected,expected_sequence=None):
                 if board.copy_at_restore:
                     board.copy_at_restore=False
                     board.user_copy('copy while verifying reply')
-                require(board.value==expected,'CLIPBOARD_USER_CHANGED')
-                board.user_copy(saved['text'])
+                require(board.value==expected and (expected_sequence is None or
+                    board.sequence()==expected_sequence),'CLIPBOARD_USER_CHANGED')
+                board.user_copy(board.image if saved['image'] else saved['text'])
+                board.last_write_sequence=board.generation
         self.board=Board()
         self.board.writes=[]
         self.board.read_times=[]
@@ -721,14 +736,34 @@ class InterruptionRetryTests(FileFixture,unittest.TestCase):
             self.board.writes[0][1]['expires'])
         self.assert_same_operation()
 
-    def test_image_interruption_is_preserved_when_it_cannot_be_snapshotted(self):
+    def test_image_uses_same_quiet_window_and_request(self):
         self.board.interrupt_attempts={1}
-        self.clock.events=[(1000.1,self.board.image)]
+        self.clock.events=[(1015,self.board.image)]
+        self.submit()
+        self.assertAlmostEqual(self.board.writes[-1][0],1045,places=6)
+        self.assertIs(self.board.value,self.board.image)
+        self.assert_same_operation()
+
+    def test_unrestorable_clipboard_value_is_preserved(self):
+        self.board.interrupt_attempts={1}
+        self.clock.events=[(1000.1,self.board.unsupported)]
         with self.assertRaisesRegex(Rejected,'CLIPBOARD_NOT_PLAIN_TEXT'):
             self.submit()
         self.assertEqual(len(self.board.writes),1)
-        self.assertIs(self.board.value,self.board.image)
+        self.assertIs(self.board.value,self.board.unsupported)
         self.assertGreaterEqual(self.clock.now(),1030)
+
+    def test_wait_before_first_send_does_not_expire_the_request(self):
+        self.client.user_priority.owned(self.board.sequence())
+        self.board.user_copy(self.board.image)
+        self.clock.events=[(1000+20*i,self.board.image) for i in range(1,7)]
+        self.submit()
+        timestamp,message=self.board.writes[0]
+        self.assertGreaterEqual(timestamp,1150)
+        self.assertLess(timestamp,1150.2)
+        self.assertGreater(message['expires'],timestamp)
+        self.assertIs(self.board.value,self.board.image)
+        self.assert_same_operation()
 
     def test_interrupted_close_does_not_retry_an_endpoint_that_is_shutting_down(self):
         self.dispatcher.worker=None

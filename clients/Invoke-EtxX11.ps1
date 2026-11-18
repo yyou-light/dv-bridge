@@ -27,7 +27,9 @@ param(
     [int]$TimeoutSeconds = 60,
 
     [ValidateRange(30, 1800)]
-    [int]$TransferTimeoutSeconds = 600
+    [int]$TransferTimeoutSeconds = 600,
+    [ValidateRange(1, 1800)]
+    [int]$QueueWaitTimeoutSeconds = 600
 )
 
 Set-StrictMode -Version Latest
@@ -40,6 +42,8 @@ $canonicalTool = Join-Path $canonicalRoot 'local\windows_etx_packet.ps1'
 $canonicalConfluenceRestore = Join-Path $canonicalRoot 'local\windows_confluence_restore.ps1'
 $windowsPowerShell = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
 $restoreOutputDirectory = $null
+$script:queueRemainingSeconds = [double]$QueueWaitTimeoutSeconds
+. (Join-Path $PSScriptRoot 'EtxTransportQueue.ps1')
 
 function Assert-RegularFile {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -77,7 +81,7 @@ function Assert-SessionRequestPath {
     return $checked
 }
 
-function Invoke-SessionDelegate {
+function Invoke-SessionDelegateRaw {
     param([hashtable]$Parameters)
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $processArguments = [Environment]::GetCommandLineArgs()
@@ -97,12 +101,119 @@ function Invoke-SessionDelegate {
         $script:sessionDelegateMode = 'separate_process'
         $delegateArguments = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $canonicalTool)
         foreach ($key in $Parameters.Keys) {
-            $delegateArguments += @('-' + $key, [string]$Parameters[$key])
+            $delegateArguments += '-' + $key
+            $delegateArguments += [string]$Parameters[$key]
         }
         & $windowsPowerShell @delegateArguments
     }
     $script:sessionDelegateCode = $LASTEXITCODE
     $script:sessionDelegateSeconds = $timer.Elapsed.TotalSeconds
+}
+
+function Write-EtxQueueError {
+    param([string]$Code, [string]$StatePath)
+    if ($Code -notmatch '^[A-Z0-9_]{1,80}$') { $Code = 'ETX_QUEUE_LOCAL_ERROR' }
+    Write-Output ('ETX_QUEUE_ERROR=' + (@{error=$Code; phase='queue'; not_sent=$true;
+        state_file=$StatePath} | ConvertTo-Json -Compress))
+}
+
+function Invoke-SessionDelegate {
+    param([hashtable]$Parameters, [scriptblock]$BeforeDispatch, [scriptblock]$OnNotSent,
+        [object]$DispatchContext)
+    $lease = $null; $success = $false; $interrupted = $false; $serviceSeconds = 0.0
+    $script:sessionDelegateCode = 1; $script:sessionDelegateNotSent = $true
+    $script:sessionDelegateAttempts = 0; $script:sessionDelegateSeconds = 0.0
+    $script:sessionDelegateMode = 'not_started'; $script:sessionQueueSeconds = 0.0
+    $script:sessionQueueCheckSeconds = 1.0
+    $statePath = $Parameters.OutputPath + '.queue.json'
+    try {
+        $kind = [string]$Parameters.Mode
+        $requestSha = $null
+        if ($Parameters.ContainsKey('SessionRequest')) {
+            $requestSha = Get-SessionSha256 $Parameters.SessionRequest
+            if ($Parameters.Mode -eq 'SessionRpc') {
+                $spec = Get-Content -LiteralPath $Parameters.SessionRequest -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($spec.op -notmatch '^[a-z][a-z0-9_]{0,63}$') { throw 'INVALID_QUEUE_OPERATION' }
+                $kind = 'rpc-' + $spec.op
+            }
+        }
+        $configSha = Get-SessionSha256 $Parameters.SessionConfig
+        $lease = Enter-EtxQueue $projectRoot $kind $statePath $script:queueRemainingSeconds
+        while ($true) {
+            if ((Get-SessionSha256 $Parameters.SessionConfig) -cne $configSha -or
+                ($requestSha -and (Get-SessionSha256 $Parameters.SessionRequest) -cne $requestSha)) {
+                throw 'SESSION_INPUT_CHANGED_WHILE_QUEUED'
+            }
+            if ($BeforeDispatch) { & $BeforeDispatch $DispatchContext }
+            Set-EtxQueueState $lease 'dispatch'
+            $script:sessionDelegateNotSent = $false
+            $script:sessionDelegateAttempts++
+            $receiptBefore = $null
+            if (Test-Path -LiteralPath $Parameters.OutputPath) {
+                $null = Assert-RegularFile $Parameters.OutputPath
+                $itemBefore = Get-Item -LiteralPath $Parameters.OutputPath
+                $receiptBefore = [string]$itemBefore.LastWriteTimeUtc.Ticks + ':' +
+                    [string]$itemBefore.Length + ':' + (Get-SessionSha256 $Parameters.OutputPath)
+            }
+            Invoke-SessionDelegateRaw $Parameters
+            $serviceSeconds = $script:sessionDelegateSeconds
+            $reply = $null
+            if (Test-Path -LiteralPath $Parameters.OutputPath) {
+                $null = Assert-RegularFile $Parameters.OutputPath
+                $itemAfter = Get-Item -LiteralPath $Parameters.OutputPath
+                $receiptAfter = [string]$itemAfter.LastWriteTimeUtc.Ticks + ':' +
+                    [string]$itemAfter.Length + ':' + (Get-SessionSha256 $Parameters.OutputPath)
+                # A killed/failed delegate may leave a previous receipt intact.
+                # Only a response updated by this attempt can prove not-sent.
+                if ($receiptAfter -cne $receiptBefore) {
+                    $reply = Get-Content -LiteralPath $Parameters.OutputPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                }
+            }
+            if (-not $reply -and $script:sessionDelegateCode -eq 0) { throw 'ETX_RESPONSE_NOT_UPDATED' }
+            Update-EtxChannelHealth $lease $reply
+            $provenNotSent = $reply -and $reply.PSObject.Properties['error'] -and
+                $reply.error -eq 'CLIPBOARD_BUSY' -and $reply.PSObject.Properties['phase'] -and
+                $reply.phase -eq 'packet_mutex'
+            if ($script:sessionDelegateCode -ne 0 -and $provenNotSent) {
+                # A pre-update caller may race our readiness probe. Only this
+                # exact pre-send error can be retried, with the SAME input ID.
+                $script:sessionDelegateNotSent = $true
+                if ($OnNotSent) { & $OnNotSent $DispatchContext }
+                $lease.NotSentRetries++
+                $lease.WaitSeconds += $serviceSeconds
+                Wait-EtxPacketIdle $lease
+                continue
+            }
+            $success = $script:sessionDelegateCode -eq 0 -and $reply -and
+                $reply.PSObject.Properties['ok'] -and $reply.ok -eq $true
+            if ($reply -and $reply.PSObject.Properties['interruption_count']) {
+                $interrupted = [int]$reply.interruption_count -gt 0
+            }
+            # read-files may contain several RPCs; the top-level interruption
+            # count describes only its last one. Conservatively omit long RPCs.
+            if ($reply -and $reply.PSObject.Properties['timings'] -and $reply.timings.PSObject.Properties['rpc']) {
+                if (@($reply.timings.rpc | Where-Object seconds -ge 30).Count) { $interrupted=$true }
+            }
+            break
+        }
+    }
+    catch {
+        $script:sessionDelegateCode = 1
+        if ($script:sessionDelegateNotSent) {
+            if ($OnNotSent) { & $OnNotSent $DispatchContext }
+            if ($lease) { Set-EtxQueueState $lease 'not_sent' $_.Exception.Message }
+            Write-EtxQueueError $_.Exception.Message $statePath
+        }
+        else { Write-Error -ErrorRecord $_ -ErrorAction Continue }
+    }
+    finally {
+        if ($lease) {
+            $script:sessionQueueSeconds = $lease.WaitSeconds
+            $script:sessionQueueCheckSeconds = $lease.CheckSeconds
+            $script:queueRemainingSeconds = [Math]::Max(0, $script:queueRemainingSeconds-$lease.WaitSeconds)
+            Exit-EtxQueue $lease $success $serviceSeconds $interrupted
+        }
+    }
 }
 
 function Write-SessionJson {
@@ -163,10 +274,34 @@ function Invoke-SessionBatch {
     $progressPath = $SessionRequest + '.progress.json'
     $lockPath = $SessionRequest + '.lock'
     if (Test-Path -LiteralPath $lockPath) { $null = Assert-RegularFile $lockPath }
-    $batchLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate,
-        [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $batchWait = [Diagnostics.Stopwatch]::StartNew()
+    $batchLock = $null
+    while ($null -eq $batchLock) {
+        try {
+            $batchLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        }
+        catch [IO.IOException] {
+            if (($_.Exception.HResult -band 0xffff) -notin @(32,33)) { throw }
+            if ($batchWait.Elapsed.TotalSeconds -ge $script:queueRemainingSeconds) {
+                try { Write-EtxQueueJson ($sessionOutputPath+'.queue.json') @{phase='not_sent';
+                    not_sent=$true; error='ETX_QUEUE_WAIT_TIMEOUT'; queue_wait_seconds=$batchWait.Elapsed.TotalSeconds} } catch { }
+                Write-EtxQueueError 'ETX_QUEUE_WAIT_TIMEOUT' ($sessionOutputPath+'.queue.json')
+                $script:sessionBatchCode = 1
+                return
+            }
+            $folder = Join-Path $projectRoot '.work\x11\transport-queue'
+            $profile = Get-EtxQueueProfile $folder ('rpc-' + $children[0].op)
+            try { Write-EtxQueueJson ($sessionOutputPath+'.queue.json') @{phase='waiting_request';
+                not_sent=$true; queue_wait_seconds=$batchWait.Elapsed.TotalSeconds; check_seconds=$profile.CheckSeconds} } catch { }
+            Start-Sleep -Milliseconds ([int][Math]::Max(1,[Math]::Min($profile.CheckSeconds*1000,
+                ($script:queueRemainingSeconds-$batchWait.Elapsed.TotalSeconds)*1000)))
+        }
+    }
+    $script:queueRemainingSeconds = [Math]::Max(0,$script:queueRemainingSeconds-$batchWait.Elapsed.TotalSeconds)
     $delegateCalls = 0
     $delegateSeconds = 0.0
+    $queueSeconds = $batchWait.Elapsed.TotalSeconds
     try {
         if (Test-Path -LiteralPath $progressPath) {
             $null = Assert-RegularFile $progressPath
@@ -199,14 +334,24 @@ function Invoke-SessionBatch {
             if ((Get-SessionSha256 $child.request) -cne $child.request_sha256) {
                 throw 'Batch request changed before delegation'
             }
-            # Persist uncertainty BEFORE dispatch. A lost outer process never
-            # causes an automatic second submission of this child.
-            $state.state = 'uncertain'; $state.error = $null
+            # Waiting is still not_started. Mark uncertainty only AFTER admission
+            # and immediately BEFORE delegating; a killed queued caller was not sent.
+            $state.state = 'not_started'; $state.error = $null
             Write-SessionJson $progressPath $progress
             try {
-                $delegateCalls++
+                $context = @{state=$state; progress=$progress; path=$progressPath}
                 Invoke-SessionDelegate @{Mode='SessionRpc'; SessionConfig=$SessionConfig;
-                    SessionRequest=$child.request; OutputPath=$child.output}
+                    SessionRequest=$child.request; OutputPath=$child.output} -DispatchContext $context -BeforeDispatch {
+                        param($value)
+                        $value.state.state='uncertain'; $value.state.error=$null
+                        Write-SessionJson $value.path $value.progress
+                    } -OnNotSent {
+                        param($value)
+                        $value.state.state='not_started'
+                        Write-SessionJson $value.path $value.progress
+                    }
+                $delegateCalls += $script:sessionDelegateAttempts
+                $queueSeconds += $script:sessionQueueSeconds
                 $state.exit_code = $script:sessionDelegateCode
                 $state.delegate_seconds = $script:sessionDelegateSeconds
                 $delegateSeconds += $script:sessionDelegateSeconds
@@ -219,7 +364,7 @@ function Invoke-SessionBatch {
                     }
                     else { $state.error = 'CHILD_REQUEST_FAILED' }
                 }
-                else { $state.error = 'CHILD_TRANSPORT_FAILED' }
+                else { $state.error = if ($script:sessionDelegateNotSent) {'CHILD_NOT_SENT'} else {'CHILD_TRANSPORT_FAILED'} }
             }
             catch { $state.error = 'CHILD_DELEGATION_FAILED' }
             Write-SessionJson $progressPath $progress
@@ -234,7 +379,9 @@ function Invoke-SessionBatch {
         $ok = @($items | Where-Object state -ne 'complete').Count -eq 0
         Write-SessionJson $sessionOutputPath @{ok=$ok; manifest_sha256=$manifestSha; items=$items;
             timings=@{consumer_seconds=$sessionEntryTimer.Elapsed.TotalSeconds;
-                delegate_calls=$delegateCalls; delegate_seconds=$delegateSeconds}}
+                delegate_calls=$delegateCalls; delegate_seconds=$delegateSeconds; queue_wait_seconds=$queueSeconds}}
+        try { Write-EtxQueueJson ($sessionOutputPath+'.queue.json') @{phase=$(if ($ok) {'complete'} else {'finished'});
+            not_sent=($delegateCalls -eq 0); queue_wait_seconds=$queueSeconds} } catch { }
         Write-Output (@{ok=$ok; response_file=$sessionOutputPath} | ConvertTo-Json -Compress)
         $script:sessionBatchCode = if ($ok) { 0 } else { 2 }
     }
@@ -309,7 +456,8 @@ if ($Mode -in @('SessionRpc', 'SessionRpcBatch', 'SessionPair', 'SessionReadFile
     Invoke-SessionDelegate $sessionParameters
     Write-Output ('ETX_CONSUMER_TIMINGS=' + (@{mode=$script:sessionDelegateMode;
         consumer_seconds=$sessionEntryTimer.Elapsed.TotalSeconds;
-        delegate_seconds=$script:sessionDelegateSeconds} | ConvertTo-Json -Compress))
+        delegate_seconds=$script:sessionDelegateSeconds; queue_wait_seconds=$script:sessionQueueSeconds;
+        queue_check_seconds=$script:sessionQueueCheckSeconds} | ConvertTo-Json -Compress))
     exit $script:sessionDelegateCode
 }
 

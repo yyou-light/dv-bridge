@@ -126,6 +126,41 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.project.upload(manifest)['state'],'committed')
         self.assertEqual(calls,['hello','upload_begin','upload_status','upload_chunk','commit'])
 
+    def test_upload_keeps_a_prepared_large_chunk_and_uses_small_new_chunks(self):
+        import base64
+        source=self.root/'.private/x11/source.txt'
+        raw=b'x'*(client.CHUNK+client.UPLOAD_CHUNK+1)
+        source.write_bytes(raw)
+        manifest=source.parent/'upload.json'
+        client.save(manifest,{'files':[{'source':str(source),'target':'/srv/test/project/file.txt',
+            'expected_before_sha256':'absent'}]})
+        first=raw[:client.CHUNK]
+        transfer=self.project.sub_id('upload-0')
+        operation=self.project.sub_id('upload-chunk-0-0')
+        pending={'id':operation,'op':'upload_chunk','args':{'transfer_id':transfer,'offset':0,
+            'data':base64.b64encode(first).decode('ascii'),'sha256':client.sha(first)}}
+        path=self.project.requests/(operation+'.json')
+        client.save(path,pending)
+        lengths=[]
+        def rpc(op,args,name=None):
+            if op=='hello':return {}
+            if op=='upload_begin':return {'received':0}
+            if op=='upload_status':return {'received':0,'prefix_sha256':client.sha(b'')}
+            if op=='upload_chunk':
+                if not lengths:
+                    self.assertEqual(args,pending['args'])
+                    self.assertEqual(self.project.sub_id(name),operation)
+                size=len(base64.b64decode(args['data'],validate=True))
+                lengths.append(size)
+                end=args['offset']+size
+                return {'received':end,'prefix_sha256':client.sha(raw[:end])}
+            if op=='commit':return {'state':'committed','files':[]}
+            self.fail(op)
+        self.project.rpc=rpc
+        self.assertEqual(self.project.upload(manifest)['state'],'committed')
+        self.assertEqual(lengths,[client.CHUNK,client.UPLOAD_CHUNK,1])
+        self.assertEqual(client.read_json(path),pending)
+
 
     def test_task_payload_hash_checked_before_returning_results(self):
         payload={'result':'PASS'};raw=client.json_bytes(payload)
@@ -195,6 +230,13 @@ exit 0
         wrapper=wrapper.replace("$canonicalRoot = $projectRoot",
             "$canonicalRoot = '"+str(canonical).replace("'","''")+"'")
         self.wrapper=tools/'Invoke-EtxX11.ps1';self.wrapper.write_text(wrapper,encoding='utf-8')
+        namespace=os.urandom(8).hex()
+        self.queue_name='Local\\ETX_Queue_Test_'+namespace
+        self.packet_name='Local\\ETX_Packet_Test_'+namespace
+        queue=(HERE.parent/'clients/EtxTransportQueue.ps1').read_text(encoding='utf-8')
+        queue=queue.replace('Local\\ETX_X11_ConsumerQueueV1',self.queue_name)
+        queue=queue.replace('Local\\ETX_X11_WindowsPacket',self.packet_name)
+        (tools/'EtxTransportQueue.ps1').write_text(queue,encoding='utf-8')
 
     def tearDown(self): self.temp.cleanup()
 
