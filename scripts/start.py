@@ -14,11 +14,11 @@ import uuid
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'etx'),str(ROOT/'clients')]
-from site_config import site,configure
+from site_config import site,configure,release_identity
 from configure import verify_release,write
 
 
-def endpoint():
+def endpoint(reload=False):
     if os.name!='posix' or not os.environ.get('DISPLAY'):raise ValueError('USE_AN_EXISTING_GRAPHICAL_ETX_TERMINAL')
     from session_runner_pause import identity,same_process
     from session_files import Files,file_lock
@@ -60,8 +60,10 @@ def endpoint():
             write(path,config)
             print(json.dumps({'backup':str(backup),'before_sha256':hashlib.sha256(before).hexdigest(),
                 'after_sha256':hashlib.sha256(path.read_bytes()).hexdigest()}),flush=True)
-        result=subprocess.run([sys.executable,'-B',str(ROOT/'etx/session_agent.py'),
-            'start-control','--config',str(path)],timeout=45)
+        command=[sys.executable,'-B',str(ROOT/'etx/session_agent.py'),
+            'start-control','--config',str(path)]
+        if reload:command.append('--reload')
+        result=subprocess.run(command,timeout=45)
         return result.returncode
 
 
@@ -73,15 +75,30 @@ def worker(profile):
         str(ROOT/'worker-runtime/sim_control.py'),profile])
 
 
+def verify():
+    from etx_cli import Project
+
+    local_release = release_identity()
+    result = Project(ROOT, uuid.uuid4().hex).rpc('hello', {}, 'verify-release')
+    remote_release = (result.get('endpoint') or {}).get('release')
+    matched = local_release == remote_release
+    print(json.dumps({'state': 'verified' if matched else 'upgrade_incomplete',
+        'windows_release': local_release, 'etx_release': remote_release}))
+    return 0 if matched else 1
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     commands=parser.add_subparsers(dest='command',required=True)
-    commands.add_parser('endpoint')
+    start=commands.add_parser('endpoint')
+    start.add_argument('--reload',action='store_true',help='reload an active receiver from an older release')
     run=commands.add_parser('worker');run.add_argument('profile',choices=['work01','work02','work03','work04','work05'])
     pair=commands.add_parser('pair');pair.add_argument('fingerprint')
+    commands.add_parser('verify',help='compare the Windows release with the paired ETX receiver')
     args=parser.parse_args();os.umask(0o077);verify_release();configure()
-    if args.command=='endpoint':return endpoint()
+    if args.command=='endpoint':return endpoint(args.reload)
     if args.command=='worker':return worker(args.profile)
+    if args.command=='verify':return verify()
     from etx_cli import Project
     value=Project(ROOT,uuid.uuid4().hex).pair(args.fingerprint)
     print(json.dumps({'paired':True,'endpoint':value.get('endpoint')}))

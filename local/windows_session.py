@@ -780,8 +780,8 @@ class Client:
             finally:
                 self.phase_metrics['clipboard_restore_seconds'] += time.perf_counter()-restore_started
 
-    def hello(self,fingerprint=None):
-        value=self.exchange(request(uuid.uuid4().hex,'hello',{},now=self.now()),fingerprint)
+    def hello(self,fingerprint=None,request_id=None):
+        value=self.exchange(request(request_id or uuid.uuid4().hex,'hello',{},now=self.now()),fingerprint)
         self.session=value['session']
         self.session_expires=value['expires']
         if self.config.get('connection_state'):
@@ -790,6 +790,9 @@ class Client:
         return value
 
     def call(self,operation,arguments,operation_id=None):
+        if operation=='hello':
+            require(arguments=={},'BAD_FIELDS')
+            return self.hello(request_id=operation_id)
         if self.session is None or self.session_expires<=self.now():
             self.hello()
         operation_id=operation_id or uuid.uuid4().hex

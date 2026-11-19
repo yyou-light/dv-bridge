@@ -28,14 +28,20 @@
 
 波形任务也占用一个匹配的空闲 Worker；有 `workNN` 输出后缀时绑定对应编号。没有匹配闲置编号会报告忙，不应为此取消其他任务或清除占用。不需要另开常驻 Verdi 窗口。
 
-## 从 0.2.0 升级到 0.3.0
+## 双端升级
 
-0.3.0 的 Windows 客户端会校验 Linux 回包与实际发送的请求一致，升级时要配套更新两端。升级复用已有配置、密钥、配对凭据、Worker、任务号和队列。
+把 Windows 客户端和实际运行的 ETX 接收端作为一次升级。可以直接委托 AI 执行，已有配置、身份、Worker 和任务继续使用。分享版文件上传的范围由站点配置，端点自身的安装和重载需要站点维护入口。有该入口时，由 AI 代办。否则通过首次安装时获准的文件传递方式交接完整发布包一次，由可操作 ETX 安装目录的一方完成第 2、3 步。
 
-1. 暂缓发起新请求，等正在进行的收发和安装事务完成。备份将替换的公开文件和发布清单。
-2. 用你所在站点获准的方式更新两端的公开文件，连同同版本的 `config/release.json`。Linux 侧此次运行代码的变化在 `etx/session_agent.py`，Windows 侧包含新的排队脚本与客户端。保留 `.private/`、运行状态目录及原 Worker 进程。
-3. 通过站点已有的维护方式只重载 ETX 收发接收端。若由 supervisor 看护，可按下节第 3 步核对接收进程身份并让 supervisor 拉起新版本。
-4. 接收端 ready 后，用同版 Windows 客户端做一次只读查询或合成文件回读。检查原任务状态及回执，上传中断时使用原事务和已准备的请求。若升级失败，恢复两端同版本的文件和发布清单，再重载接收端。
+1. 在目标版本的 Windows 源码目录运行 `python scripts/build_release.py --check` 和 `python scripts/build_release.py`，生成 `.work/dist/etx-clipboard-bridge-<版本>.zip` 及 SHA256 文件。将同一份包用于两端。等当前收发和安装事务结束，再备份两端将替换的公开文件和发布清单。
+2. 用发布包更新两个现有安装目录中的公开文件，最后更新 `config/release.json`。保留 `.private/`、运行状态目录及原 Worker 进程。两端各运行一次 `python scripts/build_release.py --check` 校验安装文件，Linux 使用 `python3`。
+3. 在原图形 ETX 的安装目录执行 `python3 scripts/start.py endpoint --reload`。从 0.3.1 起，这个命令检查当前运行的版本，必要时只让 supervisor 重载原接收器，确认新接收器 ready 后才成功返回。普通 `endpoint` 遇到旧进程会提示 `upgrade_reload_required`。
+4. AI 在 Windows 的安装目录执行 `python scripts/start.py verify`，使用现有配对向运行中的接收器核实版本及发布清单 SHA256。看到 `"state": "verified"` 后，用一小段普通文字检查双向粘贴，并用 Runner 读回一个已授权的小文本文件。
+
+`upgrade_reload_required` 表示磁盘版本和运行中的接收端版本不同。`upgrade_incomplete` 表示 Windows 收到的接收端版本缺失或发布清单不一致。核对两个安装目录及接收端重载结果后重新验证。升级中断时保留原任务号和回执。需要回退时，恢复两端各自的备份和旧发布清单，再按目标版本支持的方式重载接收端。
+
+### 从 0.2.0 升级到 0.3.0
+
+0.3.0 开始绑定回包和实际发送的请求，Windows 客户端与 ETX 接收端都需要更新。若目标版本就是 0.3.0，第 3 步使用站点现有维护方式重载接收端，第 4 步用同版 Windows 客户端做一次只读回读。0.3.1 才提供上述两个命令。
 
 ## 升级文件能力时保留现有 Worker
 

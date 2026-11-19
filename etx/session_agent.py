@@ -17,7 +17,7 @@ import traceback
 import unittest
 import uuid
 from pathlib import Path
-from site_config import site, configure
+from site_config import site, configure, release_identity
 
 from session_protocol import (Crypto, Rejected, require, canonical, strict_json,
     digest, MAX_SESSION, MAGIC,is_frame,normalize_frame,identifier,validate_request)
@@ -242,7 +242,28 @@ def endpoint_status_directory(config):
     return private_directory(state.with_name(state.name+'-status'))
 
 
-def start_files(config, config_path, popen=None, sleep=time.sleep, inspect=None):
+def reload_receiver(receiver, config_path, inspect):
+    from session_runner_pause import same_process
+
+    process = receiver['process_identity']
+    pid = receiver['pid']
+    require(type(pid) is int and pid > 1 and process['pid'] == pid, 'ENDPOINT_PROCESS_CHANGED')
+    try:
+        args = (Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')
+        script = str(Path(__file__).resolve()).encode()
+        config = str(Path(config_path).absolute()).encode()
+        require(any(args[i:i+4] == [script, b'serve', b'--config', config]
+                    for i in range(len(args))), 'ENDPOINT_PROCESS_CHANGED')
+        require(same_process(process, inspect(pid)), 'ENDPOINT_PROCESS_CHANGED')
+        os.kill(pid, signal.SIGTERM)
+    except FileNotFoundError:
+        # The supervisor may already be replacing this receiver.
+        require(not same_process(process, inspect(pid)), 'ENDPOINT_PROCESS_CHANGED')
+    except ProcessLookupError:
+        pass
+
+
+def start_files(config, config_path, popen=None, sleep=time.sleep, inspect=None, *, reload=False):
     """Start this fixed maintainer detached from the terminal, at most once."""
     import subprocess
     from session_runner_pause import identity,same_process
@@ -250,6 +271,7 @@ def start_files(config, config_path, popen=None, sleep=time.sleep, inspect=None)
     popen=popen or subprocess.Popen
     inspect=inspect or identity
     folder=endpoint_status_directory(config)
+    expected_release=release_identity()
     def snapshot():
         values={}
         for name in ('supervisor','receiver'):
@@ -267,15 +289,24 @@ def start_files(config, config_path, popen=None, sleep=time.sleep, inspect=None)
             'maintain-files','--config',str(Path(config_path).absolute())]
         popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,start_new_session=True)
+    reload_sent=False
     for _ in range(80):
         value=snapshot();supervisor,receiver=value['supervisor'],value['receiver']
         if (alive(supervisor) and alive(receiver) and receiver.get('state')=='ready' and
                 receiver.get('endpoint_id')==config['endpoint_id'] and
                 supervisor.get('generation')==receiver.get('generation') and
                 supervisor.get('child_pid')==receiver.get('pid')):
-            return {'state':'ready','endpoint_id':config['endpoint_id'],
-                'supervisor_pid':supervisor['pid'],'receiver_pid':receiver['pid'],
-                'generation':receiver['generation'],'lease_seconds':receiver['lease_seconds']}
+            if receiver.get('release')==expected_release:
+                return {'state':'ready','endpoint_id':config['endpoint_id'],
+                    'supervisor_pid':supervisor['pid'],'receiver_pid':receiver['pid'],
+                    'generation':receiver['generation'],'lease_seconds':receiver['lease_seconds'],
+                    'release':expected_release}
+            if not reload:
+                return {'state':'upgrade_reload_required','installed_release':expected_release,
+                    'active_release':receiver.get('release')}
+            if not reload_sent:
+                reload_receiver(receiver,config_path,inspect)
+                reload_sent=True
         if supervisor.get('state') in ('blocked','waiting_runner_idle'):
             return {'state':supervisor['state'],'last_error':supervisor.get('last_error')}
         sleep(0.25)
@@ -417,7 +448,8 @@ def serve(config, config_path, pause_requested, generation=0):
                 'generation':generation,'supervised':generation>0,'pid':os.getpid(),
                 'display':config['display'],'lease_number':1,
                 'lease_seconds':config['session_seconds'],'read_roots':config['allowed_roots'],
-                'write_roots':config['write_roots'],'workers_enabled':worker is not None}
+                'write_roots':config['write_roots'],'workers_enabled':worker is not None,
+                'release':release_identity()}
             if os.name=='posix':
                 from session_runner_pause import identity
                 dispatcher.endpoint_info['process_identity']=identity(os.getpid())
@@ -561,12 +593,15 @@ def main():
     parser.add_argument('--config',required=True)
     parser.add_argument('--request-id');parser.add_argument('--worker-profile')
     parser.add_argument('--generation',type=int,default=0)
+    parser.add_argument('--reload',action='store_true')
     args=parser.parse_args()
+    if args.reload and args.operation!='start-control':
+        parser.error('--reload requires start-control')
     os.umask(0o077);sys.dont_write_bytecode=True
     try:
         config=load_config(args.config)
         if args.operation in ('start-files','start-control'):
-            result=start_files(config,args.config)
+            result=start_files(config,args.config,reload=args.reload)
             print(json.dumps(result),flush=True)
             return 0 if result['state']=='ready' else 2
         if args.operation=='maintain-files':return maintain_files(config,args.config)

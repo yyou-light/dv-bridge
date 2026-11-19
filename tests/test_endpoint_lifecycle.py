@@ -186,10 +186,44 @@ class SupervisorTests(unittest.TestCase):
             atomic_json(folder/'supervisor.json',{'state':'running','pid':10,'child_pid':11,
                 'generation':3,'process_identity':process(10)})
             atomic_json(folder/'receiver.json',{'state':'ready','pid':11,'generation':3,
-                'endpoint_id':uid(9),'lease_seconds':3600,'process_identity':process(11)})
+                'endpoint_id':uid(9),'lease_seconds':3600,'process_identity':process(11),
+                'release':site_config.release_identity()})
             with patch.object(agent.subprocess if hasattr(agent,'subprocess') else subprocess,'Popen') as spawn:
                 result=agent.start_files(config,'unused',popen=spawn,inspect=process,sleep=lambda _:None)
             self.assertEqual(result['state'],'ready');spawn.assert_not_called()
+
+    def test_older_receiver_requires_reload_and_reuses_supervisor(self):
+        with tempfile.TemporaryDirectory(dir=TEST_TEMP) as tmp:
+            config = {'profile': 'files-online-v1', 'state': str(Path(tmp)/'state'),
+                      'endpoint_id': uid(9)}
+            folder = agent.endpoint_status_directory(config)
+
+            def process(pid):
+                return {'pid': pid, 'start': 'unchanged', 'exe': 'python', 'cwd': 'owned'}
+
+            def publish(pid, generation, release=None):
+                atomic_json(folder/'supervisor.json', {'state': 'running', 'pid': 10,
+                    'child_pid': pid, 'generation': generation, 'process_identity': process(10)})
+                atomic_json(folder/'receiver.json', {'state': 'ready', 'pid': pid,
+                    'generation': generation, 'endpoint_id': uid(9), 'lease_seconds': 3600,
+                    'process_identity': process(pid), 'release': release})
+
+            publish(11, 3)
+            spawn = unittest.mock.Mock()
+            with patch.object(agent, 'reload_receiver') as reload:
+                result = agent.start_files(config, 'unused', popen=spawn, inspect=process)
+                self.assertEqual(result['state'], 'upgrade_reload_required')
+                reload.assert_not_called()
+
+                reload.side_effect = lambda *_: publish(12, 4, site_config.release_identity())
+                result = agent.start_files(config, 'unused', popen=spawn, inspect=process,
+                                           sleep=lambda _: None, reload=True)
+                self.assertEqual(result['state'], 'ready')
+                self.assertEqual((result['supervisor_pid'], result['receiver_pid']), (10, 12))
+                self.assertEqual(result['release'], site_config.release_identity())
+                self.assertEqual(reload.call_args.args[0]['pid'], 11)
+                reload.assert_called_once()
+            spawn.assert_not_called()
 
     def test_stale_parent_pid_does_not_adopt_or_kill_an_orphan_receiver(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP) as tmp:

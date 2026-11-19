@@ -1,5 +1,6 @@
 """Owner-controlled deployment settings; contains paths and public policy, not keys."""
 import copy
+from hashlib import sha256
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -109,6 +110,14 @@ def release_files():
     if value.get('version')!=1 or not isinstance(value.get('files'),dict):
         raise ValueError('INVALID_RELEASE_MANIFEST')
     return value['files']
+
+
+def release_identity():
+    raw = (ROOT / 'config/release.json').read_bytes()
+    version = json.loads(raw).get('release')
+    if not isinstance(version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+        raise ValueError('INVALID_RELEASE_MANIFEST')
+    return {'version': version, 'manifest_sha256': sha256(raw).hexdigest()}
 
 
 def native_output(case,seed,profile):
